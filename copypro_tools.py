@@ -2332,11 +2332,13 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         self.custom_sizes=load_custom_sizes(); self.paper_cb.config(values=self._paper_names())
     def _paper_names(self): return list(PAPER_SIZES_MM)+list(self.custom_sizes)
     def _build(self):
-        # Two-column workspace: fixed settings on the left; large preview above
-        # a compact source strip on the right.
+        # Three-column workspace:
+        # fixed settings on the left, large preview in the middle,
+        # and a compact source-file panel on the right.
         self.grid_rowconfigure(0,weight=1)
         self.grid_columnconfigure(0,weight=0)
         self.grid_columnconfigure(1,weight=1)
+        self.grid_columnconfigure(2,weight=0)
 
         # LEFT: fixed compact settings. No settings scrollbar or mouse-wheel capture.
         left=tk.Frame(self,bg=SURFACE,width=286)
@@ -2423,62 +2425,192 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         styled_btn(left,"Print current layout  (Ctrl+P)",self._print_current_layout,style="secondary").pack(fill="x",padx=12,pady=2)
         self.status=lbl(left,"",8,MUTED); self.status.pack(padx=12,anchor="w",pady=(0,4))
 
-        # RIGHT: preview dominates the upper area; compact imports stay at bottom.
-        content=tk.Frame(self,bg=BG)
-        content.grid(row=0,column=1,sticky="nsew",padx=8,pady=8)
-        content.grid_rowconfigure(0,weight=1)
-        content.grid_rowconfigure(1,weight=0)
-        content.grid_columnconfigure(0,weight=1)
+        # MIDDLE: the imposed-sheet preview receives most of the window.
+        preview_panel=tk.Frame(self,bg=BG)
+        preview_panel.grid(row=0,column=1,sticky="nsew",padx=(8,4),pady=8)
+        preview_panel.grid_rowconfigure(1,weight=1)
+        preview_panel.grid_columnconfigure(0,weight=1)
 
-        preview_panel=tk.Frame(content,bg=BG)
-        preview_panel.grid(row=0,column=0,sticky="nsew")
-        preview_panel.grid_rowconfigure(1,weight=1); preview_panel.grid_columnconfigure(0,weight=1)
-        ph=tk.Frame(preview_panel,bg=BG); ph.grid(row=0,column=0,sticky="ew",pady=(0,4))
+        ph=tk.Frame(preview_panel,bg=BG)
+        ph.grid(row=0,column=0,sticky="ew",pady=(0,4))
         lbl(ph,"FINAL IMPOSED SHEETS",9,MUTED,True).pack(side="left")
-        self.preview_count_lbl=lbl(ph,"0 sheets",8,MUTED); self.preview_count_lbl.pack(side="right")
-        preview_body=tk.Frame(preview_panel,bg=BG,highlightbackground=BORDER,highlightthickness=1)
+        self.preview_count_lbl=lbl(ph,"0 sheets",8,MUTED)
+        self.preview_count_lbl.pack(side="right")
+
+        preview_body=tk.Frame(
+            preview_panel,
+            bg=SURFACE,
+            highlightbackground=BORDER,
+            highlightthickness=1,
+        )
         preview_body.grid(row=1,column=0,sticky="nsew")
-        preview_body.grid_rowconfigure(0,weight=1); preview_body.grid_columnconfigure(0,weight=1)
-        self.preview_canvas=tk.Canvas(preview_body,bg="#A7A7A7",highlightthickness=0)
-        preview_v=ttk.Scrollbar(preview_body,orient="vertical",command=self.preview_canvas.yview)
-        preview_h=ttk.Scrollbar(preview_body,orient="horizontal",command=self.preview_canvas.xview)
-        self.preview_canvas.configure(yscrollcommand=preview_v.set,xscrollcommand=preview_h.set)
-        self.preview_canvas.grid(row=0,column=0,sticky="nsew"); preview_v.grid(row=0,column=1,sticky="ns"); preview_h.grid(row=1,column=0,sticky="ew")
-        self.preview_frame=tk.Frame(self.preview_canvas,bg="#A7A7A7")
-        self.preview_window=self.preview_canvas.create_window((0,0),window=self.preview_frame,anchor="nw")
-        self.preview_frame.bind("<Configure>",lambda e:self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all")))
-        self.preview_canvas.bind("<Configure>",lambda e:(self.preview_canvas.itemconfig(self.preview_window,width=e.width),self._schedule_preview()))
-        def preview_wheel(event): self.preview_canvas.yview_scroll(int(-event.delta/120),"units")
-        self.preview_canvas.bind("<Enter>",lambda e:self.preview_canvas.bind_all("<MouseWheel>",preview_wheel))
-        self.preview_canvas.bind("<Leave>",lambda e:self.preview_canvas.unbind_all("<MouseWheel>"))
-        self.setup_drop(self.preview_canvas,self._drop_files,IMAGE_EXTS | {".pdf"})
+        preview_body.grid_rowconfigure(0,weight=1)
+        preview_body.grid_columnconfigure(0,weight=1)
+
+        self.preview_canvas=tk.Canvas(
+            preview_body,
+            bg=BG,
+            highlightthickness=0,
+        )
+        preview_v=ttk.Scrollbar(
+            preview_body,
+            orient="vertical",
+            command=self.preview_canvas.yview,
+        )
+        preview_h=ttk.Scrollbar(
+            preview_body,
+            orient="horizontal",
+            command=self.preview_canvas.xview,
+        )
+        self.preview_canvas.configure(
+            yscrollcommand=preview_v.set,
+            xscrollcommand=preview_h.set,
+        )
+        self.preview_canvas.grid(row=0,column=0,sticky="nsew")
+        preview_v.grid(row=0,column=1,sticky="ns")
+        preview_h.grid(row=1,column=0,sticky="ew")
+
+        self.preview_frame=tk.Frame(self.preview_canvas,bg=BG)
+        self.preview_window=self.preview_canvas.create_window(
+            (0,0),
+            window=self.preview_frame,
+            anchor="nw",
+        )
+        self.preview_frame.bind(
+            "<Configure>",
+            lambda e:self.preview_canvas.configure(
+                scrollregion=self.preview_canvas.bbox("all")
+            ),
+        )
+        self.preview_canvas.bind(
+            "<Configure>",
+            lambda e:(
+                self.preview_canvas.itemconfig(
+                    self.preview_window,
+                    width=max(1,e.width),
+                ),
+                self._schedule_preview(),
+            ),
+        )
+
+        def preview_wheel(event):
+            self.preview_canvas.yview_scroll(int(-event.delta/120),"units")
+            return "break"
+
+        self.preview_canvas.bind(
+            "<Enter>",
+            lambda e:self.preview_canvas.bind_all("<MouseWheel>",preview_wheel),
+        )
+        self.preview_canvas.bind(
+            "<Leave>",
+            lambda e:self.preview_canvas.unbind_all("<MouseWheel>"),
+        )
+        self.setup_drop(
+            self.preview_canvas,
+            self._drop_files,
+            IMAGE_EXTS | {".pdf"},
+        )
         self.preview_images=[]
 
-        imports=tk.Frame(content,bg=SURFACE,height=190,highlightbackground=BORDER,highlightthickness=1)
-        imports.grid(row=1,column=0,sticky="ew",pady=(7,0))
+        # RIGHT: compact vertical source-file panel. The file list scrolls,
+        # while the drop area remains fixed at the bottom.
+        imports=tk.Frame(
+            self,
+            bg=SURFACE,
+            width=270,
+            highlightbackground=BORDER,
+            highlightthickness=1,
+        )
+        imports.grid(row=0,column=2,sticky="nsew",padx=(4,8),pady=8)
         imports.grid_propagate(False)
-        imports.grid_rowconfigure(1,weight=1); imports.grid_columnconfigure(0,weight=1)
-        ih=tk.Frame(imports,bg=SURFACE); ih.grid(row=0,column=0,columnspan=2,sticky="ew",padx=8,pady=(5,2))
+        imports.grid_rowconfigure(1,weight=1)
+        imports.grid_columnconfigure(0,weight=1)
+
+        ih=tk.Frame(imports,bg=SURFACE)
+        ih.grid(row=0,column=0,sticky="ew",padx=8,pady=(7,4))
         lbl(ih,"SOURCE FILES",8,MUTED,True).pack(side="left")
         styled_btn(ih,"Add",self._add_files).pack(side="right",padx=(4,0))
         styled_btn(ih,"Clear",self._clear,style="secondary").pack(side="right")
-        cards_wrap=tk.Frame(imports,bg=SURFACE); cards_wrap.grid(row=1,column=0,sticky="nsew",padx=(6,3),pady=(0,6))
-        cards_wrap.grid_rowconfigure(0,weight=1); cards_wrap.grid_columnconfigure(0,weight=1)
-        self.cards_canvas=tk.Canvas(cards_wrap,bg=SURFACE,highlightthickness=0,height=140)
-        cards_h=ttk.Scrollbar(cards_wrap,orient="horizontal",command=self.cards_canvas.xview)
-        self.cards_canvas.configure(xscrollcommand=cards_h.set)
-        self.cards_canvas.grid(row=0,column=0,sticky="nsew"); cards_h.grid(row=1,column=0,sticky="ew")
+
+        cards_wrap=tk.Frame(imports,bg=SURFACE)
+        cards_wrap.grid(row=1,column=0,sticky="nsew",padx=6,pady=(0,5))
+        cards_wrap.grid_rowconfigure(0,weight=1)
+        cards_wrap.grid_columnconfigure(0,weight=1)
+
+        self.cards_canvas=tk.Canvas(
+            cards_wrap,
+            bg=SURFACE,
+            highlightthickness=0,
+        )
+        cards_v=ttk.Scrollbar(
+            cards_wrap,
+            orient="vertical",
+            command=self.cards_canvas.yview,
+        )
+        self.cards_canvas.configure(yscrollcommand=cards_v.set)
+        self.cards_canvas.grid(row=0,column=0,sticky="nsew")
+        cards_v.grid(row=0,column=1,sticky="ns")
+
         self.cards_frame=tk.Frame(self.cards_canvas,bg=SURFACE)
-        self.cards_win=self.cards_canvas.create_window((0,0),window=self.cards_frame,anchor="nw")
-        self.cards_frame.bind("<Configure>",lambda e:self.cards_canvas.configure(scrollregion=self.cards_canvas.bbox("all")))
-        def cards_wheel(event): self.cards_canvas.xview_scroll(int(-event.delta/120),"units")
-        self.cards_canvas.bind("<Enter>",lambda e:self.cards_canvas.bind_all("<MouseWheel>",cards_wheel))
-        self.cards_canvas.bind("<Leave>",lambda e:self.cards_canvas.unbind_all("<MouseWheel>"))
-        self.setup_drop(self.cards_canvas,self._drop_files,IMAGE_EXTS | {".pdf"})
-        self.drop_zone=tk.Label(imports,text="⬇  DROP FILES",bg=SURFACE2,fg=MUTED,font=("Segoe UI",8,"bold"),width=16,cursor="hand2")
-        self.drop_zone.grid(row=1,column=1,sticky="ns",padx=(3,7),pady=(0,7))
+        self.cards_win=self.cards_canvas.create_window(
+            (0,0),
+            window=self.cards_frame,
+            anchor="nw",
+        )
+        self.cards_frame.bind(
+            "<Configure>",
+            lambda e:self.cards_canvas.configure(
+                scrollregion=self.cards_canvas.bbox("all")
+            ),
+        )
+        self.cards_canvas.bind(
+            "<Configure>",
+            lambda e:self.cards_canvas.itemconfig(
+                self.cards_win,
+                width=max(1,e.width),
+            ),
+        )
+
+        def cards_wheel(event):
+            self.cards_canvas.yview_scroll(int(-event.delta/120),"units")
+            return "break"
+
+        self.cards_canvas.bind(
+            "<Enter>",
+            lambda e:self.cards_canvas.bind_all("<MouseWheel>",cards_wheel),
+        )
+        self.cards_canvas.bind(
+            "<Leave>",
+            lambda e:self.cards_canvas.unbind_all("<MouseWheel>"),
+        )
+        self.setup_drop(
+            self.cards_canvas,
+            self._drop_files,
+            IMAGE_EXTS | {".pdf"},
+        )
+
+        self.drop_zone=tk.Label(
+            imports,
+            text="⬇  DROP FILES HERE",
+            bg=SURFACE2,
+            fg=MUTED,
+            font=("Segoe UI",8,"bold"),
+            cursor="hand2",
+            pady=11,
+        )
+        self.drop_zone.grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            padx=7,
+            pady=(0,7),
+        )
         self.drop_zone.bind("<Button-1>",lambda e:self._add_files())
-        self.setup_drop(self.drop_zone,self._drop_files,IMAGE_EXTS | {".pdf"})
+        self.setup_drop(
+            self.drop_zone,
+            self._drop_files,
+            IMAGE_EXTS | {".pdf"},
+        )
 
         self.bind_all("<Control-p>",self._ctrl_p)
         self.bind_all("<Control-P>",self._ctrl_p)
@@ -2595,11 +2727,11 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         self.fit_lbl.config(text=(f"Centered: {gw:.1f} × {gh:.1f} mm" if fits else f"Does not fit: {gw:.1f} × {gh:.1f} mm"),fg=MUTED if fits else DANGER)
         if not self.files or not self.canvases:
             self.preview_count_lbl.config(text="0 sheets")
-            tk.Label(self.preview_frame,text="Add source files to see the final imposed sheets",bg="#A7A7A7",fg="#444444",font=("Segoe UI",12)).grid(row=0,column=0,pady=70,padx=30)
+            tk.Label(self.preview_frame,text="Add source files to see the final imposed sheets",bg=BG,fg=MUTED,font=("Segoe UI",12)).grid(row=0,column=0,pady=70,padx=30)
             return
         if not fits:
             self.preview_count_lbl.config(text="Layout does not fit")
-            tk.Label(self.preview_frame,text="The current grid is larger than the selected paper.",bg="#A7A7A7",fg=DANGER,font=("Segoe UI",11,"bold")).grid(row=0,column=0,pady=70,padx=30)
+            tk.Label(self.preview_frame,text="The current grid is larger than the selected paper.",bg=BG,fg=DANGER,font=("Segoe UI",11,"bold")).grid(row=0,column=0,pady=70,padx=30)
             return
         specs=self._page_specs()
         self.preview_count_lbl.config(text=f"{len(specs)} sheet{'s' if len(specs)!=1 else ''}")
@@ -2609,7 +2741,7 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         card_w=max(190,min(330,(available-(ncols-1)*12)//ncols-14))
         for idx,(assignments,back,label) in enumerate(specs):
             r,col=divmod(idx,ncols)
-            card=tk.Frame(self.preview_frame,bg="#A7A7A7",padx=5,pady=5)
+            card=tk.Frame(self.preview_frame,bg=SURFACE,padx=7,pady=7,highlightbackground=BORDER,highlightthickness=1)
             card.grid(row=r,column=col,padx=6,pady=6,sticky="n")
             try:
                 # Rendering at 55 DPI is enough for a clear on-screen preview and
@@ -2620,15 +2752,15 @@ class PrintLayoutTab(tk.Frame,DropMixin):
                 shown=sheet.resize((max(1,int(sheet.width*scale)),max(1,int(sheet.height*scale))),Image.LANCZOS)
                 photo=ImageTk.PhotoImage(shown)
                 self.preview_images.append(photo)
-                tk.Label(card,image=photo,bg="#A7A7A7",bd=2,relief="solid",highlightbackground="#555555",highlightthickness=1).pack()
-                tk.Label(card,text=label,bg="#A7A7A7",fg="#202020",font=("Segoe UI",8,"bold"),wraplength=card_w).pack(fill="x",pady=(4,0))
+                tk.Label(card,image=photo,bg=SURFACE2,bd=0,highlightbackground=BORDER,highlightthickness=1).pack()
+                tk.Label(card,text=label,bg=SURFACE,fg=TEXT,font=("Segoe UI",8,"bold"),wraplength=card_w).pack(fill="x",pady=(5,0))
             except Exception as ex:
                 tk.Label(card,text=f"Preview failed\n{ex}",bg=BG,fg=DANGER,font=("Segoe UI",8),wraplength=card_w).pack(padx=8,pady=20)
         for col in range(ncols): self.preview_frame.grid_columnconfigure(col,weight=1)
         self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all"))
     def _show_empty(self):
         for w in self.cards_frame.winfo_children(): w.destroy()
-        tk.Label(self.cards_frame,text="No files loaded",bg=SURFACE,fg=MUTED,font=("Segoe UI",9)).pack(side="left",padx=20,pady=45)
+        tk.Label(self.cards_frame,text="No files loaded",bg=SURFACE,fg=MUTED,font=("Segoe UI",9)).pack(fill="x",padx=12,pady=35)
         self._schedule_preview()
     def _add_files(self):
         exts=" ".join(f"*{e}" for e in (IMAGE_EXTS | {".pdf"}))
@@ -2669,14 +2801,47 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         if not self.files:self._show_empty();return
         dpi=int(self.dpi_var.get()); tw=mm_to_px(max(.1,self._num(self.item_w,90)),dpi); th=mm_to_px(max(.1,self._num(self.item_h,50)),dpi)
         for i,path in enumerate(self.files):
-            cell=tk.Frame(self.cards_frame,bg=SURFACE2,padx=5,pady=5,width=190,height=135)
-            cell.pack(side="left",padx=4,pady=3)
-            cell.pack_propagate(False)
+            cell=tk.Frame(
+                self.cards_frame,
+                bg=SURFACE2,
+                padx=7,
+                pady=7,
+                highlightbackground=BORDER,
+                highlightthickness=1,
+            )
+            cell.pack(fill="x",padx=4,pady=4)
             try:
-                cc=PrintCropCanvas(cell,path,tw,th,size=(175,82),on_change=self._schedule_preview); cc.pack()
-                cc.set_effects(self.gray_var.get(),self.brightness_var.get()); self.canvases.append((path,cc))
-                tk.Label(cell,text=self.display_names.get(path,os.path.basename(path)),bg=SURFACE2,fg=MUTED,font=("Segoe UI",8),wraplength=175,justify="left").pack(fill="x",pady=(3,0))
-                acts=tk.Frame(cell,bg=SURFACE2); acts.pack(fill="x",pady=(3,0))
+                # The source preview is deliberately sized below the right-panel
+                # width and allowed to keep its natural card height, preventing
+                # crop controls, filenames, or buttons from being clipped.
+                cc=PrintCropCanvas(
+                    cell,
+                    path,
+                    tw,
+                    th,
+                    size=(220,105),
+                    on_change=self._schedule_preview,
+                )
+                cc.pack(anchor="center")
+                cc.set_effects(
+                    self.gray_var.get(),
+                    self.brightness_var.get(),
+                )
+                self.canvases.append((path,cc))
+
+                tk.Label(
+                    cell,
+                    text=self.display_names.get(path,os.path.basename(path)),
+                    bg=SURFACE2,
+                    fg=MUTED,
+                    font=("Segoe UI",8),
+                    wraplength=220,
+                    justify="left",
+                    anchor="w",
+                ).pack(fill="x",pady=(5,0))
+
+                acts=tk.Frame(cell,bg=SURFACE2)
+                acts.pack(fill="x",pady=(5,0))
                 buttons=(
                     ("↑",lambda p=path:self._move_source(p,-1)),
                     ("↓",lambda p=path:self._move_source(p,1)),
@@ -2685,9 +2850,29 @@ class PrintLayoutTab(tk.Frame,DropMixin):
                     ("✕",lambda p=path:self._remove(p)),
                 )
                 for t,cmd in buttons:
-                    tk.Button(acts,text=t,command=cmd,bg=SURFACE,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2").pack(side="left",fill="x",expand=True,padx=1)
+                    tk.Button(
+                        acts,
+                        text=t,
+                        command=cmd,
+                        bg=SURFACE,
+                        fg=TEXT,
+                        relief="flat",
+                        font=("Segoe UI",8,"bold"),
+                        cursor="hand2",
+                    ).pack(
+                        side="left",
+                        fill="x",
+                        expand=True,
+                        padx=1,
+                    )
             except Exception as ex:
-                tk.Label(cell,text=str(ex)[:70],bg=SURFACE2,fg=DANGER,wraplength=175).pack()
+                tk.Label(
+                    cell,
+                    text=str(ex)[:100],
+                    bg=SURFACE2,
+                    fg=DANGER,
+                    wraplength=220,
+                ).pack(fill="x",padx=4,pady=12)
         self._schedule_preview()
     def _current_layout(self):
         return {"paper":self.paper_var.get(),"orientation":self.orientation_var.get(),"item_w":self._num(self.item_w,90),"item_h":self._num(self.item_h,50),"cols":int(self._num(self.cols_var,2)),"rows":int(self._num(self.rows_var,5)),"mode":self.mode_var.get(),"duplex":self.duplex_var.get(),"bleed":self.bleed_var.get(),"bleed_mm":self._num(self.bleed_mm,3),"spacing":self._num(self.spacing_var,6),"grayscale":self.gray_var.get(),"brightness":int(self.brightness_var.get()),"dpi":int(self.dpi_var.get()),"cut_marks":self.cut_marks_var.get(),"cut_labels":self.cut_labels_var.get()}
