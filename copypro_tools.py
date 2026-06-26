@@ -317,9 +317,10 @@ HANDLE_SIZE = 9         # corner handle hit-box half-size, in canvas px
 MIN_CROP_FRAC = 0.15    # don't allow shrinking the crop box below 15% of the fitted size
 
 class CropCanvas(tk.Canvas):
-    def __init__(self, parent, img_path, target_w, target_h, size=(300,300), **kw):
+    def __init__(self, parent, img_path, target_w, target_h, size=(300,300), on_change=None, **kw):
         super().__init__(parent, width=size[0], height=size[1],
                          bg=SURFACE2, highlightthickness=0, **kw)
+        self.on_change = on_change
         self.target_w, self.target_h = target_w, target_h
         self.canvas_w, self.canvas_h = size
         self.src_path = img_path
@@ -329,10 +330,19 @@ class CropCanvas(tk.Canvas):
         self._draw()
         self.bind("<ButtonPress-1>",   self._press)
         self.bind("<B1-Motion>",       self._drag)
-        self.bind("<ButtonRelease-1>", lambda e: setattr(self,'_ds',None))
+        self.bind("<ButtonRelease-1>", self._release_crop)
         self.bind("<Motion>",          self._on_hover)
         self._ds = None
         self._drag_mode = None  # "move" or one of "nw","ne","sw","se"
+
+    def _notify_change(self):
+        if callable(self.on_change):
+            try: self.on_change()
+            except Exception: pass
+
+    def _release_crop(self, _event=None):
+        self._ds = None
+        self._notify_change()
 
     @property
     def rotated(self):
@@ -391,6 +401,7 @@ class CropCanvas(tk.Canvas):
         self._fit_to_canvas()
         self._init_crop()
         self._draw()
+        self._notify_change()
 
     def _init_crop(self):
         """Default crop = FIT the whole image (nothing cropped away).
@@ -477,6 +488,7 @@ class CropCanvas(tk.Canvas):
         else:
             self._resize_from_handle(e)
         self._draw()
+        self._notify_change()
 
     def _resize_from_handle(self, e):
         """Resize the crop box from a corner, keeping the target aspect ratio locked.
@@ -671,7 +683,7 @@ class ResizerTab(tk.Frame, DropMixin):
         self.size_cb.bind("<<ComboboxSelected>>", self._on_size)
         # Label shown below dropdown when Custom is active
         self.custom_size_lbl = tk.Label(left, text="", bg=SURFACE, fg=ACCENT,
-            font=("Segoe UI", 8, "bold"), anchor="w")
+            font=("Segoe UI", 10, "bold"), anchor="w")
         self.custom_w_mm = 100.0
         self.custom_h_mm = 100.0
 
@@ -1761,7 +1773,6 @@ class StickerCutlineTab(tk.Frame, DropMixin):
         lbl(controls, "EDGE DETECTION", 8, MUTED, True).pack(anchor="w", padx=16, pady=(4, 2))
 
         self.tolerance_var = tk.IntVar(value=15)
-        self.smoothing_var = tk.DoubleVar(value=0.5)
         self.min_area_var = tk.DoubleVar(value=0.05)
         self.offset_var = tk.DoubleVar(value=0.0)
         self.include_holes_var = tk.BooleanVar(value=False)
@@ -1769,7 +1780,6 @@ class StickerCutlineTab(tk.Frame, DropMixin):
         self.line_width_var = tk.DoubleVar(value=0.25)
 
         self._add_scale(controls, "White tolerance", self.tolerance_var, 0, 80, 1)
-        self._add_scale(controls, "Smoothing (%)", self.smoothing_var, 0, 3, 0.1)
         self._add_scale(controls, "Minimum object area (%)", self.min_area_var, 0, 5, 0.05)
         self._add_scale(controls, "Outline offset (mm)", self.offset_var, -3, 10, 0.1)
 
@@ -2043,7 +2053,7 @@ class StickerCutlineTab(tk.Frame, DropMixin):
             retrieval = cv2.RETR_TREE if self.include_holes_var.get() else cv2.RETR_EXTERNAL
             contours, hierarchy = cv2.findContours(mask, retrieval, cv2.CHAIN_APPROX_NONE)
             min_area = image.width * image.height * max(0.0, float(self.min_area_var.get())) / 100.0
-            smooth = max(0.0, float(self.smoothing_var.get())) / 100.0
+            smooth = 0.0
 
             result = []
             for index, contour in enumerate(contours):
@@ -2115,7 +2125,6 @@ class StickerCutlineTab(tk.Frame, DropMixin):
 
     def _reset_settings(self):
         self.tolerance_var.set(15)
-        self.smoothing_var.set(0.5)
         self.min_area_var.set(0.05)
         self.offset_var.set(0.0)
         self.include_holes_var.set(False)
@@ -2323,108 +2332,119 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         self.custom_sizes=load_custom_sizes(); self.paper_cb.config(values=self._paper_names())
     def _paper_names(self): return list(PAPER_SIZES_MM)+list(self.custom_sizes)
     def _build(self):
-        # Three-column workspace: settings | imposed-sheet preview | source files.
+        # Two-column workspace: fixed settings on the left; large preview above
+        # a compact source strip on the right.
         self.grid_rowconfigure(0,weight=1)
         self.grid_columnconfigure(0,weight=0)
         self.grid_columnconfigure(1,weight=1)
-        self.grid_columnconfigure(2,weight=0)
 
-        # LEFT: settings stay visible and have their own scrollbar.
-        left_wrap=tk.Frame(self,bg=SURFACE,width=300)
-        left_wrap.grid(row=0,column=0,sticky="ns",padx=(0,1))
-        left_wrap.grid_propagate(False)
-        left_canvas=tk.Canvas(left_wrap,bg=SURFACE,highlightthickness=0,width=278)
-        left_scroll=ttk.Scrollbar(left_wrap,orient="vertical",command=left_canvas.yview)
-        left_canvas.configure(yscrollcommand=left_scroll.set)
-        left_canvas.pack(side="left",fill="both",expand=True)
-        left_scroll.pack(side="right",fill="y")
-        left=tk.Frame(left_canvas,bg=SURFACE)
-        left_win=left_canvas.create_window((0,0),window=left,anchor="nw")
-        left.bind("<Configure>",lambda e:left_canvas.configure(scrollregion=left_canvas.bbox("all")))
-        left_canvas.bind("<Configure>",lambda e:left_canvas.itemconfig(left_win,width=e.width))
-        def left_wheel(event): left_canvas.yview_scroll(int(-event.delta/120),"units")
-        left_canvas.bind("<Enter>",lambda e:left_canvas.bind_all("<MouseWheel>",left_wheel))
-        left_canvas.bind("<Leave>",lambda e:left_canvas.unbind_all("<MouseWheel>"))
+        # LEFT: fixed compact settings. No settings scrollbar or mouse-wheel capture.
+        left=tk.Frame(self,bg=SURFACE,width=286)
+        left.grid(row=0,column=0,sticky="nsew",padx=(0,1))
+        left.grid_propagate(False)
 
-        lbl(left,"PRINT LAYOUT",8,MUTED,True).pack(pady=(12,4),padx=16,anchor="w")
-        pr=tk.Frame(left,bg=SURFACE); pr.pack(fill="x",padx=16)
+        lbl(left,"PRINT LAYOUT",8,MUTED,True).pack(pady=(8,3),padx=12,anchor="w")
+        pr=tk.Frame(left,bg=SURFACE); pr.pack(fill="x",padx=12)
         self.layout_var=tk.StringVar(value="Default")
-        self.layout_cb=ttk.Combobox(pr,textvariable=self.layout_var,values=list(self.layouts),state="readonly",width=20)
+        self.layout_cb=ttk.Combobox(pr,textvariable=self.layout_var,values=list(self.layouts),state="readonly",width=18)
         self.layout_cb.pack(side="left",fill="x",expand=True)
         self.layout_cb.bind("<<ComboboxSelected>>",lambda e:self._load_layout(self.layout_var.get()))
         tk.Button(pr,text="Save",command=self._save_layout_dialog,bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2").pack(side="left",padx=(5,0))
 
-        lbl(left,"Paper size").pack(padx=16,anchor="w",pady=(7,0))
+        lbl(left,"Paper size",8).pack(padx=12,anchor="w",pady=(5,0))
         self.paper_var=tk.StringVar(value="A4")
         self.paper_cb=ttk.Combobox(left,textvariable=self.paper_var,values=self._paper_names(),state="readonly")
-        self.paper_cb.pack(fill="x",padx=16,pady=(2,3)); self.paper_cb.bind("<<ComboboxSelected>>",self._changed)
-        rr=tk.Frame(left,bg=SURFACE); rr.pack(fill="x",padx=16)
+        self.paper_cb.pack(fill="x",padx=12,pady=(1,2)); self.paper_cb.bind("<<ComboboxSelected>>",self._changed)
+        rr=tk.Frame(left,bg=SURFACE); rr.pack(fill="x",padx=12)
         self.orientation_var=tk.StringVar(value="Portrait")
         for x in ("Portrait","Landscape"):
             tk.Radiobutton(rr,text=x,variable=self.orientation_var,value=x,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._changed).pack(side="left")
         self.dpi_var=tk.IntVar(value=300)
-        ttk.Combobox(rr,textvariable=self.dpi_var,values=[150,300,600],state="readonly",width=6).pack(side="right")
-        lbl(rr,"DPI",8,MUTED).pack(side="right",padx=4)
+        ttk.Combobox(rr,textvariable=self.dpi_var,values=[150,300,600],state="readonly",width=5).pack(side="right")
+        lbl(rr,"DPI",7,MUTED).pack(side="right",padx=3)
 
         sep(left)
-        grid_hdr=tk.Frame(left,bg=SURFACE); grid_hdr.pack(fill="x",padx=16)
+        grid_hdr=tk.Frame(left,bg=SURFACE); grid_hdr.pack(fill="x",padx=12)
         lbl(grid_hdr,"ITEM & GRID",8,MUTED,True).pack(side="left")
-        tk.Button(grid_hdr,text="Auto layout…",command=self._open_layout_calculator,bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2",padx=7,pady=2).pack(side="right")
-        size_row=tk.Frame(left,bg=SURFACE); size_row.pack(fill="x",padx=16,pady=(3,0))
+        tk.Button(grid_hdr,text="Auto…",command=self._open_layout_calculator,bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2",padx=6,pady=1).pack(side="right")
+        size_row=tk.Frame(left,bg=SURFACE); size_row.pack(fill="x",padx=12,pady=(2,0))
         self.item_w=tk.DoubleVar(value=90); self.item_h=tk.DoubleVar(value=50)
         self.cols_var=tk.IntVar(value=2); self.rows_var=tk.IntVar(value=5)
         for i,(t,v) in enumerate((("Width",self.item_w),("Height",self.item_h))):
             f=tk.Frame(size_row,bg=SURFACE); f.pack(side="left",fill="x",expand=True,padx=(0 if i==0 else 4,0))
             lbl(f,t+" (mm)",7,MUTED).pack(anchor="w"); e=entry(f,v,7); e.pack(fill="x"); e.bind("<KeyRelease>",self._changed)
-        tk.Button(size_row,text="Presets…",command=self._open_item_size_presets,bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2",padx=7,pady=4).pack(side="left",padx=(6,0),pady=(12,0))
-        grid=tk.Frame(left,bg=SURFACE); grid.pack(fill="x",padx=16,pady=(4,0))
+        tk.Button(size_row,text="Presets",command=self._open_item_size_presets,bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",7,"bold"),cursor="hand2",padx=5,pady=3).pack(side="left",padx=(5,0),pady=(11,0))
+
+        def grid_spin(parent,label,var):
+            f=tk.Frame(parent,bg=SURFACE)
+            lbl(f,label,7,MUTED).pack(anchor="w")
+            sp=tk.Spinbox(f,from_=1,to=99,textvariable=var,width=7,bg=SURFACE2,fg=TEXT,
+                          insertbackground=TEXT,buttonbackground=SURFACE2,relief="flat",
+                          font=("Segoe UI",9),command=self._changed)
+            sp.pack(fill="x")
+            sp.bind("<KeyRelease>",self._changed)
+            def wheel(ev):
+                step=1 if ev.delta>0 else -1
+                try: var.set(max(1,min(99,int(var.get())+step)))
+                except Exception: var.set(1)
+                self._changed(); return "break"
+            sp.bind("<MouseWheel>",wheel)
+            return f
+
+        grid=tk.Frame(left,bg=SURFACE); grid.pack(fill="x",padx=12,pady=(3,0))
         for i,(t,v) in enumerate((("Columns",self.cols_var),("Rows",self.rows_var))):
-            f=tk.Frame(grid,bg=SURFACE); f.grid(row=0,column=i,padx=(0 if i==0 else 4,0),sticky="ew"); grid.grid_columnconfigure(i,weight=1)
-            lbl(f,t,7,MUTED).pack(anchor="w"); e=entry(f,v,7); e.pack(fill="x"); e.bind("<KeyRelease>",self._changed)
-        mr=tk.Frame(left,bg=SURFACE); mr.pack(fill="x",padx=16,pady=(6,0)); self.mode_var=tk.StringVar(value="Repeat")
+            f=grid_spin(grid,t,v); f.grid(row=0,column=i,padx=(0 if i==0 else 4,0),sticky="ew"); grid.grid_columnconfigure(i,weight=1)
+
+        mr=tk.Frame(left,bg=SURFACE); mr.pack(fill="x",padx=12,pady=(4,0)); self.mode_var=tk.StringVar(value="Repeat")
         for x in ("Repeat","Cut & stack","In order"):
             tk.Radiobutton(mr,text=x,variable=self.mode_var,value=x,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._mode_changed).pack(anchor="w")
         self.duplex_var=tk.BooleanVar(value=True)
-        tk.Checkbutton(left,text="Double-sided (left bind)",variable=self.duplex_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",9),command=self._changed).pack(padx=16,anchor="w")
+        tk.Checkbutton(left,text="Double-sided (left bind)",variable=self.duplex_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._changed).pack(padx=12,anchor="w")
 
-        sep(left); lbl(left,"SPACING & BLEED",8,MUTED,True).pack(padx=16,anchor="w")
-        sr=tk.Frame(left,bg=SURFACE); sr.pack(fill="x",padx=16,pady=(3,0)); lbl(sr,"Trim spacing (mm)",8).pack(side="left")
+        sep(left); lbl(left,"SPACING & BLEED",8,MUTED,True).pack(padx=12,anchor="w")
+        sr=tk.Frame(left,bg=SURFACE); sr.pack(fill="x",padx=12,pady=(2,0)); lbl(sr,"Trim spacing (mm)",8).pack(side="left")
         self.spacing_var=tk.DoubleVar(value=6); e=entry(sr,self.spacing_var,6); e.pack(side="right"); e.bind("<KeyRelease>",self._changed)
-        br=tk.Frame(left,bg=SURFACE); br.pack(fill="x",padx=16,pady=(3,0)); self.bleed_var=tk.BooleanVar(value=True)
-        tk.Checkbutton(br,text="Add bleed",variable=self.bleed_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",9),command=self._toggle_bleed).pack(side="left")
-        self.bleed_mm=tk.DoubleVar(value=3); self.bleed_entry=entry(br,self.bleed_mm,6); self.bleed_entry.pack(side="right"); self.bleed_entry.bind("<KeyRelease>",self._changed); lbl(br,"mm",8,MUTED).pack(side="right",padx=3)
-        cr=tk.Frame(left,bg=SURFACE); cr.pack(fill="x",padx=16,pady=(3,0))
+        br=tk.Frame(left,bg=SURFACE); br.pack(fill="x",padx=12,pady=(2,0)); self.bleed_var=tk.BooleanVar(value=True)
+        tk.Checkbutton(br,text="Add bleed",variable=self.bleed_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._toggle_bleed).pack(side="left")
+        self.bleed_mm=tk.DoubleVar(value=3); self.bleed_entry=entry(br,self.bleed_mm,5); self.bleed_entry.pack(side="right"); self.bleed_entry.bind("<KeyRelease>",self._changed); lbl(br,"mm",7,MUTED).pack(side="right",padx=2)
+        cr=tk.Frame(left,bg=SURFACE); cr.pack(fill="x",padx=12,pady=(2,0))
         self.cut_marks_var=tk.BooleanVar(value=False); self.cut_labels_var=tk.BooleanVar(value=False)
         tk.Checkbutton(cr,text="Cut marks",variable=self.cut_marks_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._toggle_cut_marks).pack(side="left")
-        self.cut_labels_chk=tk.Checkbutton(cr,text="Distance labels",variable=self.cut_labels_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._changed)
+        self.cut_labels_chk=tk.Checkbutton(cr,text="Labels",variable=self.cut_labels_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._changed)
         self.cut_labels_chk.pack(side="right")
 
-        sep(left); lbl(left,"IMAGE ADJUSTMENTS",8,MUTED,True).pack(padx=16,anchor="w")
+        sep(left); lbl(left,"IMAGE ADJUSTMENTS",8,MUTED,True).pack(padx=12,anchor="w")
         self.gray_var=tk.BooleanVar(value=False)
-        tk.Checkbutton(left,text="Grayscale",variable=self.gray_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",9),command=self._effects_changed).pack(padx=16,anchor="w")
-        self.brightness_var=tk.IntVar(value=100); self.brightness_lbl=lbl(left,"Brightness: 100%",8); self.brightness_lbl.pack(padx=16,anchor="w")
-        ttk.Scale(left,from_=25,to=175,variable=self.brightness_var,orient="horizontal",command=self._brightness_changed).pack(fill="x",padx=16)
-        self.fit_lbl=lbl(left,"",8,MUTED); self.fit_lbl.pack(padx=16,anchor="w",pady=(3,1))
-        self.export_btn=styled_btn(left,"Export PDF",self._export_pdf,style="success"); self.export_btn.pack(fill="x",padx=16,pady=(8,3))
-        styled_btn(left,"Print current layout  (Ctrl+P)",self._print_current_layout,style="secondary").pack(fill="x",padx=16,pady=3)
-        self.status=lbl(left,"",8,MUTED); self.status.pack(padx=16,anchor="w",pady=(0,12))
+        tk.Checkbutton(left,text="Grayscale",variable=self.gray_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._effects_changed).pack(padx=12,anchor="w")
+        self.brightness_var=tk.IntVar(value=100); self.brightness_lbl=lbl(left,"Brightness: 100%",8); self.brightness_lbl.pack(padx=12,anchor="w")
+        ttk.Scale(left,from_=25,to=175,variable=self.brightness_var,orient="horizontal",command=self._brightness_changed).pack(fill="x",padx=12)
+        self.fit_lbl=lbl(left,"",8,MUTED); self.fit_lbl.pack(padx=12,anchor="w",pady=(2,0))
+        self.export_btn=styled_btn(left,"Export PDF",self._export_pdf,style="success"); self.export_btn.pack(fill="x",padx=12,pady=(5,2))
+        styled_btn(left,"Print current layout  (Ctrl+P)",self._print_current_layout,style="secondary").pack(fill="x",padx=12,pady=2)
+        self.status=lbl(left,"",8,MUTED); self.status.pack(padx=12,anchor="w",pady=(0,4))
 
-        # MIDDLE: largest area, independently scrollable final-sheet previews.
-        preview_panel=tk.Frame(self,bg=BG)
-        preview_panel.grid(row=0,column=1,sticky="nsew",padx=10,pady=8)
+        # RIGHT: preview dominates the upper area; compact imports stay at bottom.
+        content=tk.Frame(self,bg=BG)
+        content.grid(row=0,column=1,sticky="nsew",padx=8,pady=8)
+        content.grid_rowconfigure(0,weight=1)
+        content.grid_rowconfigure(1,weight=0)
+        content.grid_columnconfigure(0,weight=1)
+
+        preview_panel=tk.Frame(content,bg=BG)
+        preview_panel.grid(row=0,column=0,sticky="nsew")
         preview_panel.grid_rowconfigure(1,weight=1); preview_panel.grid_columnconfigure(0,weight=1)
-        ph=tk.Frame(preview_panel,bg=BG); ph.grid(row=0,column=0,sticky="ew",pady=(0,6))
+        ph=tk.Frame(preview_panel,bg=BG); ph.grid(row=0,column=0,sticky="ew",pady=(0,4))
         lbl(ph,"FINAL IMPOSED SHEETS",9,MUTED,True).pack(side="left")
         self.preview_count_lbl=lbl(ph,"0 sheets",8,MUTED); self.preview_count_lbl.pack(side="right")
-        preview_body=tk.Frame(preview_panel,bg=BG)
+        preview_body=tk.Frame(preview_panel,bg=BG,highlightbackground=BORDER,highlightthickness=1)
         preview_body.grid(row=1,column=0,sticky="nsew")
         preview_body.grid_rowconfigure(0,weight=1); preview_body.grid_columnconfigure(0,weight=1)
-        self.preview_canvas=tk.Canvas(preview_body,bg=SURFACE2,highlightthickness=0)
+        self.preview_canvas=tk.Canvas(preview_body,bg="#A7A7A7",highlightthickness=0)
         preview_v=ttk.Scrollbar(preview_body,orient="vertical",command=self.preview_canvas.yview)
         preview_h=ttk.Scrollbar(preview_body,orient="horizontal",command=self.preview_canvas.xview)
         self.preview_canvas.configure(yscrollcommand=preview_v.set,xscrollcommand=preview_h.set)
         self.preview_canvas.grid(row=0,column=0,sticky="nsew"); preview_v.grid(row=0,column=1,sticky="ns"); preview_h.grid(row=1,column=0,sticky="ew")
-        self.preview_frame=tk.Frame(self.preview_canvas,bg=SURFACE2)
+        self.preview_frame=tk.Frame(self.preview_canvas,bg="#A7A7A7")
         self.preview_window=self.preview_canvas.create_window((0,0),window=self.preview_frame,anchor="nw")
         self.preview_frame.bind("<Configure>",lambda e:self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all")))
         self.preview_canvas.bind("<Configure>",lambda e:(self.preview_canvas.itemconfig(self.preview_window,width=e.width),self._schedule_preview()))
@@ -2434,34 +2454,32 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         self.setup_drop(self.preview_canvas,self._drop_files,IMAGE_EXTS | {".pdf"})
         self.preview_images=[]
 
-        # RIGHT: compact source-file controls and crop cards; drop zone stays at bottom.
-        files_panel=tk.Frame(self,bg=SURFACE,width=260)
-        files_panel.grid(row=0,column=2,sticky="ns",padx=(1,0))
-        files_panel.grid_propagate(False)
-        lbl(files_panel,"SOURCE FILES",8,MUTED,True).pack(anchor="w",padx=10,pady=(12,4))
-        actions=tk.Frame(files_panel,bg=SURFACE); actions.pack(fill="x",padx=10,pady=(0,5))
-        styled_btn(actions,"Add",self._add_files).pack(side="left",fill="x",expand=True,padx=(0,3))
-        styled_btn(actions,"Clear",self._clear,style="secondary").pack(side="left",fill="x",expand=True,padx=(3,0))
-        cards_wrap=tk.Frame(files_panel,bg=SURFACE); cards_wrap.pack(fill="both",expand=True,padx=6)
-        self.cards_canvas=tk.Canvas(cards_wrap,bg=SURFACE,highlightthickness=0)
-        cards_scroll=ttk.Scrollbar(cards_wrap,orient="vertical",command=self.cards_canvas.yview)
-        self.cards_canvas.configure(yscrollcommand=cards_scroll.set)
-        self.cards_canvas.pack(side="left",fill="both",expand=True); cards_scroll.pack(side="right",fill="y")
+        imports=tk.Frame(content,bg=SURFACE,height=190,highlightbackground=BORDER,highlightthickness=1)
+        imports.grid(row=1,column=0,sticky="ew",pady=(7,0))
+        imports.grid_propagate(False)
+        imports.grid_rowconfigure(1,weight=1); imports.grid_columnconfigure(0,weight=1)
+        ih=tk.Frame(imports,bg=SURFACE); ih.grid(row=0,column=0,columnspan=2,sticky="ew",padx=8,pady=(5,2))
+        lbl(ih,"SOURCE FILES",8,MUTED,True).pack(side="left")
+        styled_btn(ih,"Add",self._add_files).pack(side="right",padx=(4,0))
+        styled_btn(ih,"Clear",self._clear,style="secondary").pack(side="right")
+        cards_wrap=tk.Frame(imports,bg=SURFACE); cards_wrap.grid(row=1,column=0,sticky="nsew",padx=(6,3),pady=(0,6))
+        cards_wrap.grid_rowconfigure(0,weight=1); cards_wrap.grid_columnconfigure(0,weight=1)
+        self.cards_canvas=tk.Canvas(cards_wrap,bg=SURFACE,highlightthickness=0,height=140)
+        cards_h=ttk.Scrollbar(cards_wrap,orient="horizontal",command=self.cards_canvas.xview)
+        self.cards_canvas.configure(xscrollcommand=cards_h.set)
+        self.cards_canvas.grid(row=0,column=0,sticky="nsew"); cards_h.grid(row=1,column=0,sticky="ew")
         self.cards_frame=tk.Frame(self.cards_canvas,bg=SURFACE)
         self.cards_win=self.cards_canvas.create_window((0,0),window=self.cards_frame,anchor="nw")
         self.cards_frame.bind("<Configure>",lambda e:self.cards_canvas.configure(scrollregion=self.cards_canvas.bbox("all")))
-        self.cards_canvas.bind("<Configure>",lambda e:self.cards_canvas.itemconfig(self.cards_win,width=e.width))
-        def cards_wheel(event): self.cards_canvas.yview_scroll(int(-event.delta/120),"units")
+        def cards_wheel(event): self.cards_canvas.xview_scroll(int(-event.delta/120),"units")
         self.cards_canvas.bind("<Enter>",lambda e:self.cards_canvas.bind_all("<MouseWheel>",cards_wheel))
         self.cards_canvas.bind("<Leave>",lambda e:self.cards_canvas.unbind_all("<MouseWheel>"))
         self.setup_drop(self.cards_canvas,self._drop_files,IMAGE_EXTS | {".pdf"})
-        self.drop_zone=tk.Label(files_panel,text="⬇  Drop images or multi-page PDFs",bg=SURFACE2,fg=MUTED,font=("Segoe UI",9),pady=12,cursor="hand2")
-        self.drop_zone.pack(fill="x",side="bottom",padx=8,pady=8)
+        self.drop_zone=tk.Label(imports,text="⬇  DROP FILES",bg=SURFACE2,fg=MUTED,font=("Segoe UI",8,"bold"),width=16,cursor="hand2")
+        self.drop_zone.grid(row=1,column=1,sticky="ns",padx=(3,7),pady=(0,7))
         self.drop_zone.bind("<Button-1>",lambda e:self._add_files())
         self.setup_drop(self.drop_zone,self._drop_files,IMAGE_EXTS | {".pdf"})
 
-        # Ctrl+P is active while this tab exists. The handler ignores keystrokes
-        # when focus is inside an Entry so normal text editing still works.
         self.bind_all("<Control-p>",self._ctrl_p)
         self.bind_all("<Control-P>",self._ctrl_p)
         self._show_empty()
@@ -2577,11 +2595,11 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         self.fit_lbl.config(text=(f"Centered: {gw:.1f} × {gh:.1f} mm" if fits else f"Does not fit: {gw:.1f} × {gh:.1f} mm"),fg=MUTED if fits else DANGER)
         if not self.files or not self.canvases:
             self.preview_count_lbl.config(text="0 sheets")
-            tk.Label(self.preview_frame,text="Add source files to see the final imposed sheets",bg=SURFACE2,fg=MUTED,font=("Segoe UI",12)).grid(row=0,column=0,pady=70,padx=30)
+            tk.Label(self.preview_frame,text="Add source files to see the final imposed sheets",bg="#A7A7A7",fg="#444444",font=("Segoe UI",12)).grid(row=0,column=0,pady=70,padx=30)
             return
         if not fits:
             self.preview_count_lbl.config(text="Layout does not fit")
-            tk.Label(self.preview_frame,text="The current grid is larger than the selected paper.",bg=SURFACE2,fg=DANGER,font=("Segoe UI",11,"bold")).grid(row=0,column=0,pady=70,padx=30)
+            tk.Label(self.preview_frame,text="The current grid is larger than the selected paper.",bg="#A7A7A7",fg=DANGER,font=("Segoe UI",11,"bold")).grid(row=0,column=0,pady=70,padx=30)
             return
         specs=self._page_specs()
         self.preview_count_lbl.config(text=f"{len(specs)} sheet{'s' if len(specs)!=1 else ''}")
@@ -2591,26 +2609,26 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         card_w=max(190,min(330,(available-(ncols-1)*12)//ncols-14))
         for idx,(assignments,back,label) in enumerate(specs):
             r,col=divmod(idx,ncols)
-            card=tk.Frame(self.preview_frame,bg=BG,padx=5,pady=5)
+            card=tk.Frame(self.preview_frame,bg="#A7A7A7",padx=5,pady=5)
             card.grid(row=r,column=col,padx=6,pady=6,sticky="n")
             try:
                 # Rendering at 55 DPI is enough for a clear on-screen preview and
                 # stays responsive even when many imposed pages are shown.
-                sheet=self._sheet(assignments,back=back,dpi_override=55)
+                sheet=self._sheet(assignments,back=back,dpi_override=70,preview_guides=True)
                 max_h=420
                 scale=min(card_w/sheet.width,max_h/sheet.height,1.0)
                 shown=sheet.resize((max(1,int(sheet.width*scale)),max(1,int(sheet.height*scale))),Image.LANCZOS)
                 photo=ImageTk.PhotoImage(shown)
                 self.preview_images.append(photo)
-                tk.Label(card,image=photo,bg=BG,bd=1,relief="solid").pack()
-                tk.Label(card,text=label,bg=BG,fg=TEXT,font=("Segoe UI",8,"bold"),wraplength=card_w).pack(fill="x",pady=(4,0))
+                tk.Label(card,image=photo,bg="#A7A7A7",bd=2,relief="solid",highlightbackground="#555555",highlightthickness=1).pack()
+                tk.Label(card,text=label,bg="#A7A7A7",fg="#202020",font=("Segoe UI",8,"bold"),wraplength=card_w).pack(fill="x",pady=(4,0))
             except Exception as ex:
                 tk.Label(card,text=f"Preview failed\n{ex}",bg=BG,fg=DANGER,font=("Segoe UI",8),wraplength=card_w).pack(padx=8,pady=20)
         for col in range(ncols): self.preview_frame.grid_columnconfigure(col,weight=1)
         self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all"))
     def _show_empty(self):
         for w in self.cards_frame.winfo_children(): w.destroy()
-        tk.Label(self.cards_frame,text="No files loaded",bg=SURFACE,fg=MUTED,font=("Segoe UI",10)).pack(pady=35)
+        tk.Label(self.cards_frame,text="No files loaded",bg=SURFACE,fg=MUTED,font=("Segoe UI",9)).pack(side="left",padx=20,pady=45)
         self._schedule_preview()
     def _add_files(self):
         exts=" ".join(f"*{e}" for e in (IMAGE_EXTS | {".pdf"}))
@@ -2651,12 +2669,13 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         if not self.files:self._show_empty();return
         dpi=int(self.dpi_var.get()); tw=mm_to_px(max(.1,self._num(self.item_w,90)),dpi); th=mm_to_px(max(.1,self._num(self.item_h,50)),dpi)
         for i,path in enumerate(self.files):
-            cell=tk.Frame(self.cards_frame,bg=SURFACE2,padx=5,pady=5)
-            cell.pack(fill="x",padx=4,pady=4)
+            cell=tk.Frame(self.cards_frame,bg=SURFACE2,padx=5,pady=5,width=190,height=135)
+            cell.pack(side="left",padx=4,pady=3)
+            cell.pack_propagate(False)
             try:
-                cc=PrintCropCanvas(cell,path,tw,th,size=(205,135)); cc.pack()
+                cc=PrintCropCanvas(cell,path,tw,th,size=(175,82),on_change=self._schedule_preview); cc.pack()
                 cc.set_effects(self.gray_var.get(),self.brightness_var.get()); self.canvases.append((path,cc))
-                tk.Label(cell,text=self.display_names.get(path,os.path.basename(path)),bg=SURFACE2,fg=MUTED,font=("Segoe UI",8),wraplength=210,justify="left").pack(fill="x",pady=(3,0))
+                tk.Label(cell,text=self.display_names.get(path,os.path.basename(path)),bg=SURFACE2,fg=MUTED,font=("Segoe UI",8),wraplength=175,justify="left").pack(fill="x",pady=(3,0))
                 acts=tk.Frame(cell,bg=SURFACE2); acts.pack(fill="x",pady=(3,0))
                 buttons=(
                     ("↑",lambda p=path:self._move_source(p,-1)),
@@ -2668,7 +2687,7 @@ class PrintLayoutTab(tk.Frame,DropMixin):
                 for t,cmd in buttons:
                     tk.Button(acts,text=t,command=cmd,bg=SURFACE,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2").pack(side="left",fill="x",expand=True,padx=1)
             except Exception as ex:
-                tk.Label(cell,text=str(ex)[:70],bg=SURFACE2,fg=DANGER,wraplength=210).pack()
+                tk.Label(cell,text=str(ex)[:70],bg=SURFACE2,fg=DANGER,wraplength=175).pack()
         self._schedule_preview()
     def _current_layout(self):
         return {"paper":self.paper_var.get(),"orientation":self.orientation_var.get(),"item_w":self._num(self.item_w,90),"item_h":self._num(self.item_h,50),"cols":int(self._num(self.cols_var,2)),"rows":int(self._num(self.rows_var,5)),"mode":self.mode_var.get(),"duplex":self.duplex_var.get(),"bleed":self.bleed_var.get(),"bleed_mm":self._num(self.bleed_mm,3),"spacing":self._num(self.spacing_var,6),"grayscale":self.gray_var.get(),"brightness":int(self.brightness_var.get()),"dpi":int(self.dpi_var.get()),"cut_marks":self.cut_marks_var.get(),"cut_labels":self.cut_labels_var.get()}
@@ -2713,7 +2732,7 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         target=(mm_to_px(iw,dpi),mm_to_px(ih,dpi))
         img=self._processed(path,cc,target_px=target).resize(target,Image.LANCZOS)
         return add_bleed_and_marks(img,bleed,dpi,False) if bleed>0 else img
-    def _sheet(self,assignments,back=False,dpi_override=None):
+    def _sheet(self,assignments,back=False,dpi_override=None,preview_guides=False):
         pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,gw,gh=self._metrics(); dpi=int(dpi_override or self.dpi_var.get()); sheet=Image.new("RGB",(mm_to_px(pw,dpi),mm_to_px(ph,dpi)),"white"); by={p:c for p,c in self.canvases}
         for slot,path in enumerate(assignments):
             if not path or path not in by:continue
@@ -2721,6 +2740,22 @@ class PrintLayoutTab(tk.Frame,DropMixin):
             if back:col=cols-1-col
             item=self._item(path,by[path],dpi,iw,ih,bleed); tx=x0+col*(iw+gap)-bleed; ty=y0+row*(ih+gap)-bleed; sheet.paste(item,(mm_to_px(tx,dpi),mm_to_px(ty,dpi)))
         if self.cut_marks_var.get(): self._draw_cut_guides(sheet,pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,dpi)
+        if preview_guides:
+            draw=ImageDraw.Draw(sheet)
+            page_lw=max(1,mm_to_px(.35,dpi))
+            draw.rectangle((0,0,sheet.width-1,sheet.height-1),outline=(65,65,65),width=page_lw)
+            trim_lw=max(1,mm_to_px(.25,dpi))
+            bleed_lw=max(1,mm_to_px(.2,dpi))
+            for row in range(rows):
+                for col in range(cols):
+                    left=x0+col*(iw+gap); top=y0+row*(ih+gap)
+                    x1,y1=mm_to_px(left,dpi),mm_to_px(top,dpi)
+                    x2,y2=mm_to_px(left+iw,dpi),mm_to_px(top+ih,dpi)
+                    draw.rectangle((x1,y1,x2,y2),outline=(0,90,210),width=trim_lw)
+                    if bleed>0:
+                        bx1,by1=mm_to_px(left-bleed,dpi),mm_to_px(top-bleed,dpi)
+                        bx2,by2=mm_to_px(left+iw+bleed,dpi),mm_to_px(top+ih+bleed,dpi)
+                        draw.rectangle((bx1,by1,bx2,by2),outline=(210,45,45),width=bleed_lw)
         return sheet
     def _draw_cut_guides(self,sheet,pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,dpi):
         draw=ImageDraw.Draw(sheet)
@@ -3846,10 +3881,10 @@ class PrintCounterTab(tk.Frame):
         styled_btn(toolbar, "➕  Add Row", self._add_row).pack(side="left", padx=12)
         styled_btn(toolbar, "🗑  Clear All", self._clear_all, style="secondary").pack(side="left", padx=4)
         styled_btn(toolbar, "📋  Copy Summary", self._copy_summary, style="secondary").pack(side="left", padx=4)
-        styled_btn(toolbar, "↔  Wide format quote", self._open_wide_format_quote, style="secondary").pack(side="left", padx=4)
+        styled_btn(toolbar, "↔  WIDE FORMAT PRICING", self._open_wide_format_quote, style="success").pack(side="right", padx=12)
         tk.Label(toolbar,
                  text="Enter amount*code, for example 8*710 — Enter adds the next row",
-                 bg=SURFACE, fg=MUTED, font=("Segoe UI", 8)).pack(side="right", padx=12)
+                 bg=SURFACE, fg=MUTED, font=("Segoe UI", 8)).pack(side="right", padx=8)
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True)
@@ -3858,15 +3893,15 @@ class PrintCounterTab(tk.Frame):
         left.pack(side="left", fill="both", expand=False)
         left.pack_propagate(False)
 
-        search_box = tk.Frame(left, bg=SURFACE, padx=12, pady=10)
+        search_box = tk.Frame(left, bg=SURFACE, padx=12, pady=12, highlightbackground=ACCENT, highlightthickness=2)
         search_box.pack(fill="x")
-        tk.Label(search_box, text="SEARCH KNOWN ITEMS", bg=SURFACE, fg=MUTED,
+        tk.Label(search_box, text="🔎  ITEM SEARCH — type a name or PLU code", bg=SURFACE, fg=MUTED,
                  font=("Segoe UI", 8, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
         self.search_var = tk.StringVar()
         self.search_entry = tk.Entry(search_box, textvariable=self.search_var,
             bg=SURFACE2, fg=TEXT, insertbackground=TEXT, relief="flat",
-            font=("Segoe UI", 10))
-        self.search_entry.pack(fill="x", ipady=5)
+            font=("Segoe UI", 12, "bold"))
+        self.search_entry.pack(fill="x", ipady=7)
         self.search_entry.insert(0, "")
         self.search_var.trace_add("write", lambda *_: self._update_search_results())
         self.search_entry.bind("<Down>", lambda e: self._focus_search_results())
@@ -4305,6 +4340,9 @@ class PrintCounterTab(tk.Frame):
 
             lines = []
             for code, (_description, price, item_coverage, item_label) in WIDE_FORMAT_ITEMS.items():
+                searchable = f"{_description} {item_label}".lower()
+                if "vatman" in searchable or code in {"3008", "3009"}:
+                    continue
                 include = item_coverage in (coverage, "fixed")
                 if item_coverage == "drawing":
                     include = coverage == "partial"

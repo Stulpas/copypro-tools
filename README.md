@@ -75,3 +75,14 @@ Eksportas:
 PDF šaltinio vaizdas PDF eksporte išlieka vektorinis. Įterpiami rastriniai
 vaizdai nemažinami ir papildomai nuostolingai nesuspaudžiami. Kontūro spalva –
 RGB 255, 0, 0.
+
+## Naujausi sąsajos pakeitimai
+
+- Print Layout nustatymai rodomi fiksuotame kairiajame skydelyje be slinkties.
+- Didelė galutinio maketo peržiūra rodoma viršuje, o kompaktiškas failų sąrašas – apačioje.
+- Peržiūra atsinaujina kerpant ir sukant šaltinio vaizdą.
+- Peržiūroje rodomi popieriaus, apipjovimo ir užlaidos kontūrai.
+- Eilučių ir stulpelių laukai turi rodykles ir reaguoja į pelės ratuką.
+- Lipdukų kontūrų glodinimas visada lygus 0 ir nebėra rodomas kaip nustatymas.
+- Print Counter paieška ir plataus formato kainyno mygtukas padaryti geriau matomi.
+- Vatmanas neberodomas plataus formato kainyne.
