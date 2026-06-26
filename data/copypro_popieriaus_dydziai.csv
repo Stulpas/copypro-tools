@@ -1,0 +1,13 @@
+﻿group,name,width_mm,height_mm,active,is_custom,notes_lt
+SRA,SRA3,320,450,taip,ne,
+SRA,SRA4,225,320,taip,ne,
+ISO,A3,297,420,taip,ne,
+ISO,A4,210,297,taip,ne,
+Kiti dydžiai,10×15 cm (102×152),102,152,taip,ne,
+Kiti dydžiai,21×15 cm (210×152),210,152,taip,ne,
+ISO,A5,148,210,taip,ne,
+ISO,A6,105,148,taip,ne,
+ISO,A7,74,105,taip,ne,
+ISO,A2,420,594,taip,ne,
+ISO,A1,594,841,taip,ne,
+ISO,A0,841,1189,taip,ne,
