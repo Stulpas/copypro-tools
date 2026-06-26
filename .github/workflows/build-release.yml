@@ -50,8 +50,9 @@ jobs:
             --collect-all tkinterdnd2 ^
             --collect-all pillow_heif ^
             --collect-all fitz ^
-            --add-data "data\copypro_kodai.csv;." ^
-            --add-data "data\copypro_popieriaus_dydziai.csv;." ^
+            --collect-all cv2 ^
+            --add-data "data\copypro_kodai.xlsx;." ^
+            --add-data "data\copypro_popieriaus_dydziai.xlsx;." ^
             --add-data "update_config.json;." ^
             --add-data "version.json;." ^
             copypro_tools.py
@@ -60,8 +61,8 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item "dist\CopyPro Updater.exe" "dist\CopyPro Tools\CopyPro Updater.exe"
-          Copy-Item "data\copypro_kodai.csv" "dist\CopyPro Tools\copypro_kodai.csv"
-          Copy-Item "data\copypro_popieriaus_dydziai.csv" "dist\CopyPro Tools\copypro_popieriaus_dydziai.csv"
+          Copy-Item "data\copypro_kodai.xlsx" "dist\CopyPro Tools\copypro_kodai.xlsx"
+          Copy-Item "data\copypro_popieriaus_dydziai.xlsx" "dist\CopyPro Tools\copypro_popieriaus_dydziai.xlsx"
           Copy-Item "update_config.json" "dist\CopyPro Tools\update_config.json"
           Copy-Item "version.json" "dist\CopyPro Tools\version.json"
 

@@ -3,3 +3,6 @@ pillow-heif
 PyMuPDF
 tkinterdnd2
 pyinstaller
+openpyxl
+numpy
+opencv-python-headless

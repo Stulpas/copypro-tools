@@ -1,6 +1,7 @@
-import tkinter as tk
+import tkinter as tk, time
 from tkinter import ttk, filedialog, messagebox, simpledialog
-import os, sys, threading, subprocess, io, math, tempfile, shutil, unicodedata, difflib, json, csv
+import os, sys, threading, subprocess, io, math, tempfile, shutil, unicodedata, difflib, json, csv, zipfile, webbrowser, base64, mimetypes, html
+from pathlib import Path
 from copypro_update_support import (
     current_version,
     ensure_installed_in_appdata,
@@ -20,6 +21,17 @@ except ImportError: _pip("pillow-heif"); import pillow_heif; pillow_heif.registe
 
 try: import fitz  # PyMuPDF
 except ImportError: _pip("PyMuPDF"); import fitz
+
+try: from openpyxl import load_workbook, Workbook
+except ImportError: _pip("openpyxl"); from openpyxl import load_workbook, Workbook
+
+try:
+    import numpy as np
+    import cv2
+except ImportError:
+    _pip("numpy", "opencv-python-headless")
+    import numpy as np
+    import cv2
 
 try: import tkinterdnd2 as dnd; HAS_DND = True
 except ImportError:
@@ -68,8 +80,8 @@ COPYPRO_DATA_DIR = _copypro_data_dir()
 CUSTOM_SIZES_FILE = os.path.join(COPYPRO_DATA_DIR, "custom_sizes.json")
 PRINT_LAYOUTS_FILE = os.path.join(COPYPRO_DATA_DIR, "print_layouts.json")
 APP_SETTINGS_FILE = os.path.join(COPYPRO_DATA_DIR, "settings.json")
-DEFAULT_CODES_FILE = os.path.join(COPYPRO_DATA_DIR, "copypro_kodai.csv")
-DEFAULT_PAPER_SIZES_FILE = os.path.join(COPYPRO_DATA_DIR, "copypro_popieriaus_dydziai.csv")
+DEFAULT_CODES_FILE = os.path.join(COPYPRO_DATA_DIR, "copypro_kodai.xlsx")
+DEFAULT_PAPER_SIZES_FILE = os.path.join(COPYPRO_DATA_DIR, "copypro_popieriaus_dydziai.xlsx")
 DEFAULT_WIDE_FORMAT_FILE = DEFAULT_CODES_FILE
 
 def resource_path(filename):
@@ -130,7 +142,7 @@ def save_custom_sizes(sizes_dict):
 IMAGE_EXTS = {".jpg",".jpeg",".png",".webp",".bmp",".tiff",".tif",
               ".gif",".heic",".heif",".avif",".ico",".ppm",".tga",
               ".raw",".cr2",".nef",".arw",".dng",".orf",".rw2"}
-ALL_EXTS   = IMAGE_EXTS | {".pdf",".svg",".eps",".ai",".ps"}
+ALL_EXTS   = IMAGE_EXTS | {".pdf",".svg",".eps",".ai",".ps",".pages"}
 
 CONV_FORMATS = ["PNG","JPEG","WEBP","BMP","TIFF","GIF","ICO","PDF","PPM","TGA"]
 
@@ -1218,6 +1230,46 @@ class ResizerTab(tk.Frame, DropMixin):
             self.after(0, lambda: messagebox.showinfo("Done",
                 f"Exported {done} image(s) to:\n{dest_desc}"))
 
+def _pages_member_candidates(names):
+    normalised=[name.replace("\\","/") for name in names]
+    preferred=[
+        "QuickLook/Preview.pdf","quicklook/preview.pdf","Preview.pdf","preview.pdf",
+        "QuickLook/Preview.jpg","QuickLook/Preview.jpeg","QuickLook/Preview.png",
+        "preview.jpg","preview.jpeg","preview.png",
+    ]
+    result=[]
+    lower_map={name.lower():name for name in normalised}
+    for wanted in preferred:
+        actual=lower_map.get(wanted.lower())
+        if actual and actual not in result: result.append(actual)
+    # Some Pages versions use differently named preview files.
+    for name in normalised:
+        lower=name.lower()
+        if (lower.endswith(".pdf") or lower.endswith((".jpg",".jpeg",".png"))) and ("preview" in lower or "quicklook" in lower):
+            if name not in result: result.append(name)
+    return result
+
+def extract_pages_preview(path):
+    """Return (list[PIL.Image], warning). Uses the best preview embedded by Pages."""
+    if not zipfile.is_zipfile(path):
+        raise ValueError("Šis .pages failas neturi nuskaitomo peržiūros paketo.")
+    with zipfile.ZipFile(path,"r") as package:
+        candidates=_pages_member_candidates(package.namelist())
+        if not candidates:
+            raise ValueError("Faile nerasta įterpto PDF ar vaizdo peržiūros.")
+        selected=candidates[0]
+        data=package.read(selected)
+        if selected.lower().endswith(".pdf"):
+            doc=fitz.open(stream=data,filetype="pdf")
+            images=[]
+            for page in doc:
+                pix=page.get_pixmap(matrix=fitz.Matrix(2,2),alpha=False)
+                images.append(Image.frombytes("RGB",[pix.width,pix.height],pix.samples))
+            doc.close()
+            return images,"Iš .pages failo panaudota įterpta PDF peržiūra. Patikrinkite, ar joje yra visas dokumentas."
+        image=Image.open(io.BytesIO(data)); image.load()
+        return [image.convert("RGB")],"Iš .pages failo panaudota vaizdo peržiūra. Ji gali būti mažesnės raiškos arba nepilna."
+
 # ── Converter Tab ─────────────────────────────────────────────────────────────
 class ConverterTab(tk.Frame, DropMixin):
     def __init__(self, parent):
@@ -1273,6 +1325,7 @@ class ConverterTab(tk.Frame, DropMixin):
         sep(left)
 
         styled_btn(left,"➕  Add Files",self._add_files).pack(fill="x",padx=16,pady=3)
+        styled_btn(left,"Atidaryti Pages for iCloud",lambda:webbrowser.open("https://www.icloud.com/pages"),style="secondary").pack(fill="x",padx=16,pady=3)
         styled_btn(left,"🗑   Clear All",self._clear,style="secondary").pack(fill="x",padx=16,pady=3)
         sep(left)
         self.conv_btn = styled_btn(left,"🔄  Convert All",self._convert_all,style="success")
@@ -1284,7 +1337,7 @@ class ConverterTab(tk.Frame, DropMixin):
         right.pack(side="left", fill="both", expand=True, padx=12, pady=12)
 
         self.drop_zone = tk.Label(right,
-            text="⬇  Drop files here  (images, PDFs, SVGs…)",
+            text="⬇  Drop files here  (images, PDFs, SVGs, Pages…)",
             bg=SURFACE2, fg=MUTED, font=("Segoe UI",10), pady=10, cursor="hand2")
         self.drop_zone.pack(fill="x")
         self.drop_zone.bind("<Button-1>", lambda e: self._add_files())
@@ -1374,8 +1427,13 @@ class ConverterTab(tk.Frame, DropMixin):
             pages = []
             for i, path in enumerate(self.files):
                 try:
-                    if os.path.splitext(path)[1].lower() == ".pdf":
+                    source_ext=os.path.splitext(path)[1].lower()
+                    if source_ext == ".pdf":
                         pages.extend(img.convert("RGB") for img in open_pdf_pages(path, dpi=rdpi))
+                    elif source_ext == ".pages":
+                        extracted, warning=extract_pages_preview(path)
+                        pages.extend(img.convert("RGB") for img in extracted)
+                        msgs.append(f"{os.path.basename(path)}: {warning}")
                     else:
                         pages.append(_prepare_img(Image.open(path), "PDF", bg_rgb()).convert("RGB"))
                     done += 1
@@ -1397,9 +1455,12 @@ class ConverterTab(tk.Frame, DropMixin):
             src_ext = os.path.splitext(path)[1].lower()
             base = os.path.splitext(os.path.basename(path))[0]
             try:
-                # ── PDF input → rasterise each page ──
-                if src_ext == ".pdf":
-                    pages = open_pdf_pages(path, dpi=rdpi)
+                # ── PDF / Pages input → rasterise each page ──
+                if src_ext in (".pdf",".pages"):
+                    if src_ext == ".pdf": pages = open_pdf_pages(path, dpi=rdpi)
+                    else:
+                        pages, warning = extract_pages_preview(path)
+                        msgs.append(f"{os.path.basename(path)}: {warning}")
                     for p_idx, page_img in enumerate(pages):
                         out_base = f"{base}_p{p_idx+1:03d}" if len(pages)>1 else base
                         out_dir = dest_resolver(path)
@@ -1658,6 +1719,559 @@ class PdfToolsTab(tk.Frame, DropMixin):
             self.after(0, lambda: messagebox.showinfo("Done",
                 f"Processed {done} PDF(s) → {out_dir}\nSaved ~{saved_mb:.1f} MB"))
 
+
+# ── Sticker Cut-line Tab ─────────────────────────────────────────────────────
+class StickerCutlineTab(tk.Frame, DropMixin):
+    """Create editable vector cut paths from artwork on a light background."""
+
+    SUPPORTED = IMAGE_EXTS | {".pdf"}
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        self.source_path = None
+        self.source_image = None
+        self.analysis_image = None
+        self.analysis_contours = []
+        self.source_dpi = 300.0
+        self.source_page_points = None
+        self._preview_photo = None
+        self._analysis_job = None
+        self._build()
+
+    def _build(self):
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=0)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(2, weight=0)
+
+        # LEFT: controls
+        controls = tk.Frame(self, bg=SURFACE, width=280)
+        controls.grid(row=0, column=0, sticky="nsew")
+        controls.grid_propagate(False)
+
+        lbl(controls, "VECTOR CUT LINE", 12, TEXT, True).pack(anchor="w", padx=16, pady=(16, 4))
+        lbl(
+            controls,
+            "Finds the outer edge of artwork on a white background\nand exports a real red vector path.",
+            8,
+            MUTED,
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        sep(controls)
+        lbl(controls, "EDGE DETECTION", 8, MUTED, True).pack(anchor="w", padx=16, pady=(4, 2))
+
+        self.tolerance_var = tk.IntVar(value=15)
+        self.smoothing_var = tk.DoubleVar(value=0.5)
+        self.min_area_var = tk.DoubleVar(value=0.05)
+        self.offset_var = tk.DoubleVar(value=0.0)
+        self.include_holes_var = tk.BooleanVar(value=False)
+        self.dpi_var = tk.DoubleVar(value=300.0)
+        self.line_width_var = tk.DoubleVar(value=0.25)
+
+        self._add_scale(controls, "White tolerance", self.tolerance_var, 0, 80, 1)
+        self._add_scale(controls, "Smoothing (%)", self.smoothing_var, 0, 3, 0.1)
+        self._add_scale(controls, "Minimum object area (%)", self.min_area_var, 0, 5, 0.05)
+        self._add_scale(controls, "Outline offset (mm)", self.offset_var, -3, 10, 0.1)
+
+        row = tk.Frame(controls, bg=SURFACE)
+        row.pack(fill="x", padx=16, pady=(5, 3))
+        tk.Checkbutton(
+            row,
+            text="Include internal white areas",
+            variable=self.include_holes_var,
+            bg=SURFACE,
+            fg=TEXT,
+            selectcolor=SURFACE2,
+            activebackground=SURFACE,
+            activeforeground=TEXT,
+            font=("Segoe UI", 9),
+            command=self._schedule_analysis,
+        ).pack(anchor="w")
+
+        row = tk.Frame(controls, bg=SURFACE)
+        row.pack(fill="x", padx=16, pady=3)
+        lbl(row, "Source DPI", 8, MUTED).pack(side="left")
+        dpi_entry = entry(row, self.dpi_var, 7)
+        dpi_entry.pack(side="right")
+        dpi_entry.bind("<FocusOut>", lambda _e: self._schedule_analysis())
+        dpi_entry.bind("<Return>", lambda _e: self._schedule_analysis())
+
+        sep(controls)
+        lbl(controls, "EXPORT", 8, MUTED, True).pack(anchor="w", padx=16, pady=(4, 2))
+
+        self.export_mode_var = tk.StringVar(value="outline")
+        for title, value in (
+            ("Outline only", "outline"),
+            ("Artwork + outline (separate layers)", "artwork"),
+        ):
+            tk.Radiobutton(
+                controls,
+                text=title,
+                variable=self.export_mode_var,
+                value=value,
+                bg=SURFACE,
+                fg=TEXT,
+                selectcolor=SURFACE2,
+                activebackground=SURFACE,
+                activeforeground=TEXT,
+                font=("Segoe UI", 9),
+            ).pack(anchor="w", padx=16)
+
+        row = tk.Frame(controls, bg=SURFACE)
+        row.pack(fill="x", padx=16, pady=(7, 3))
+        lbl(row, "Format", 8, MUTED).pack(side="left")
+        self.export_format_var = tk.StringVar(value="PDF")
+        self.export_format_cb = ttk.Combobox(
+            row,
+            textvariable=self.export_format_var,
+            values=["PDF", "SVG"],
+            state="readonly",
+            width=8,
+        )
+        self.export_format_cb.pack(side="right")
+
+        row = tk.Frame(controls, bg=SURFACE)
+        row.pack(fill="x", padx=16, pady=3)
+        lbl(row, "Red line width (mm)", 8, MUTED).pack(side="left")
+        entry(row, self.line_width_var, 7).pack(side="right")
+
+        self.export_btn = styled_btn(
+            controls,
+            "Export vector cut line",
+            self._export,
+            style="success",
+        )
+        self.export_btn.pack(fill="x", padx=16, pady=(12, 4))
+        self.export_btn.config(state="disabled")
+
+        styled_btn(
+            controls,
+            "Reset settings",
+            self._reset_settings,
+            style="secondary",
+        ).pack(fill="x", padx=16, pady=4)
+
+        self.status_lbl = lbl(controls, "Drop or choose an image/PDF.", 8, MUTED)
+        self.status_lbl.pack(anchor="w", padx=16, pady=(8, 12))
+
+        # MIDDLE: large preview
+        middle = tk.Frame(self, bg=BG)
+        middle.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
+        middle.grid_rowconfigure(1, weight=1)
+        middle.grid_columnconfigure(0, weight=1)
+        lbl(middle, "PREVIEW", 9, MUTED, True, bg=BG).grid(row=0, column=0, sticky="w", pady=(0, 5))
+        preview_wrap = tk.Frame(middle, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
+        preview_wrap.grid(row=1, column=0, sticky="nsew")
+        preview_wrap.grid_rowconfigure(0, weight=1)
+        preview_wrap.grid_columnconfigure(0, weight=1)
+        self.preview_canvas = tk.Canvas(preview_wrap, bg="#D8D8D8", highlightthickness=0)
+        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+        self.preview_canvas.bind("<Configure>", lambda _e: self._draw_preview())
+
+        # RIGHT: compact source panel
+        files = tk.Frame(self, bg=SURFACE, width=230)
+        files.grid(row=0, column=2, sticky="nsew")
+        files.grid_propagate(False)
+        lbl(files, "SOURCE FILE", 9, MUTED, True).pack(anchor="w", padx=14, pady=(16, 6))
+        self.file_name_lbl = lbl(files, "No file selected", 9, TEXT)
+        self.file_name_lbl.pack(anchor="w", padx=14, pady=(0, 8))
+        self.file_info_lbl = lbl(files, "", 8, MUTED)
+        self.file_info_lbl.pack(anchor="w", padx=14, pady=(0, 8))
+        styled_btn(files, "Choose file…", self._choose_file, style="secondary").pack(fill="x", padx=14, pady=4)
+        styled_btn(files, "Remove", self._clear_file, style="secondary").pack(fill="x", padx=14, pady=4)
+
+        self.drop_zone = tk.Label(
+            files,
+            text="DROP IMAGE OR PDF HERE",
+            bg=SURFACE2,
+            fg=MUTED,
+            font=("Segoe UI", 9, "bold"),
+            relief="flat",
+            bd=0,
+            height=5,
+        )
+        self.drop_zone.pack(side="bottom", fill="x", padx=14, pady=14)
+        self.setup_drop(self.drop_zone, self._add_files, self.SUPPORTED)
+
+    def _add_scale(self, parent, title, variable, start, end, resolution):
+        row = tk.Frame(parent, bg=SURFACE)
+        row.pack(fill="x", padx=16, pady=(3, 0))
+        lbl(row, title, 8, MUTED).pack(anchor="w")
+        scale = tk.Scale(
+            row,
+            from_=start,
+            to=end,
+            resolution=resolution,
+            orient="horizontal",
+            variable=variable,
+            bg=SURFACE,
+            fg=TEXT,
+            troughcolor=SURFACE2,
+            highlightthickness=0,
+            bd=0,
+            font=("Segoe UI", 8),
+            command=lambda _v: self._schedule_analysis(),
+        )
+        scale.pack(fill="x")
+
+    def _choose_file(self):
+        path = filedialog.askopenfilename(
+            title="Choose artwork",
+            filetypes=[
+                ("Artwork", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.heic *.heif *.pdf"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            self._load_file(path)
+
+    def _add_files(self, paths):
+        if paths:
+            self._load_file(paths[0])
+
+    def _clear_file(self):
+        self.source_path = None
+        self.source_image = None
+        self.analysis_image = None
+        self.analysis_contours = []
+        self.source_page_points = None
+        self.file_name_lbl.config(text="No file selected")
+        self.file_info_lbl.config(text="")
+        self.status_lbl.config(text="Drop or choose an image/PDF.", fg=MUTED)
+        self.export_btn.config(state="disabled")
+        self.preview_canvas.delete("all")
+
+    def _load_file(self, path):
+        try:
+            ext = os.path.splitext(path)[1].lower()
+            self.source_path = path
+            self.source_page_points = None
+
+            if ext == ".pdf":
+                doc = fitz.open(path)
+                if doc.page_count < 1:
+                    doc.close()
+                    raise ValueError("PDF has no pages.")
+                page = doc[0]
+                page_width_pt, page_height_pt = page.rect.width, page.rect.height
+                self.source_page_points = (page_width_pt, page_height_pt)
+                render_dpi = 180
+                pix = page.get_pixmap(matrix=fitz.Matrix(render_dpi / 72, render_dpi / 72), alpha=False)
+                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                doc.close()
+                self.source_dpi = float(render_dpi)
+                self.dpi_var.set(render_dpi)
+                info = f"PDF page 1 • {page_width_pt:.0f} × {page_height_pt:.0f} pt"
+            else:
+                raw = ImageOps.exif_transpose(Image.open(path))
+                dpi = raw.info.get("dpi", (300, 300))
+                try:
+                    detected_dpi = float(dpi[0]) if isinstance(dpi, (tuple, list)) else float(dpi)
+                    if not math.isfinite(detected_dpi) or detected_dpi < 20:
+                        detected_dpi = 300.0
+                except Exception:
+                    detected_dpi = 300.0
+                self.source_dpi = detected_dpi
+                self.dpi_var.set(round(detected_dpi, 2))
+                if raw.mode in ("RGBA", "LA") or "transparency" in raw.info:
+                    rgba = raw.convert("RGBA")
+                    bg = Image.new("RGBA", rgba.size, "white")
+                    bg.alpha_composite(rgba)
+                    img = bg.convert("RGB")
+                else:
+                    img = raw.convert("RGB")
+                info = f"{img.width} × {img.height} px • {detected_dpi:.0f} DPI"
+
+            max_side = 2600
+            if max(img.size) > max_side:
+                scale = max_side / max(img.size)
+                img = img.resize(
+                    (max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+                    Image.LANCZOS,
+                )
+
+            self.source_image = img
+            self.analysis_image = img.copy()
+            self.file_name_lbl.config(text=os.path.basename(path), wraplength=195, justify="left")
+            self.file_info_lbl.config(text=info, wraplength=195, justify="left")
+            self.export_btn.config(state="normal")
+            self._analyse()
+        except Exception as exc:
+            self._clear_file()
+            messagebox.showerror("Could not open artwork", str(exc), parent=self)
+
+    def _schedule_analysis(self):
+        if not self.source_path:
+            return
+        if self._analysis_job:
+            try:
+                self.after_cancel(self._analysis_job)
+            except Exception:
+                pass
+        self._analysis_job = self.after(180, self._analyse)
+
+    def _analyse(self):
+        self._analysis_job = None
+        if self.analysis_image is None:
+            return
+        try:
+            image = self.analysis_image
+            array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+            tolerance = max(0, min(254, int(self.tolerance_var.get())))
+            white_floor = 255 - tolerance
+            mask = np.any(array < white_floor, axis=2).astype(np.uint8) * 255
+
+            # Remove isolated noise and close tiny antialiasing gaps.
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            try:
+                dpi = max(20.0, float(self.dpi_var.get()))
+            except Exception:
+                dpi = max(20.0, self.source_dpi)
+            offset_px = int(round(float(self.offset_var.get()) / 25.4 * dpi * (image.width / max(1, self._source_pixel_width()))))
+            if offset_px != 0:
+                radius = min(250, abs(offset_px))
+                size = radius * 2 + 1
+                offset_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+                if offset_px > 0:
+                    mask = cv2.dilate(mask, offset_kernel)
+                else:
+                    mask = cv2.erode(mask, offset_kernel)
+
+            retrieval = cv2.RETR_TREE if self.include_holes_var.get() else cv2.RETR_EXTERNAL
+            contours, hierarchy = cv2.findContours(mask, retrieval, cv2.CHAIN_APPROX_NONE)
+            min_area = image.width * image.height * max(0.0, float(self.min_area_var.get())) / 100.0
+            smooth = max(0.0, float(self.smoothing_var.get())) / 100.0
+
+            result = []
+            for index, contour in enumerate(contours):
+                area = abs(cv2.contourArea(contour))
+                if area < min_area:
+                    continue
+                if self.include_holes_var.get() and hierarchy is not None:
+                    # Keep outer paths and meaningful inner holes. Tiny holes are
+                    # already removed by the area threshold above.
+                    pass
+                perimeter = cv2.arcLength(contour, True)
+                epsilon = perimeter * smooth
+                approx = cv2.approxPolyDP(contour, epsilon, True) if epsilon > 0 else contour
+                points = [(float(p[0][0]), float(p[0][1])) for p in approx]
+                if len(points) >= 3:
+                    result.append(points)
+
+            self.analysis_contours = result
+            self.status_lbl.config(
+                text=f"Detected {len(result)} vector path{'s' if len(result) != 1 else ''}.",
+                fg=SUCCESS if result else WARNING,
+            )
+            self._draw_preview()
+        except Exception as exc:
+            self.analysis_contours = []
+            self.status_lbl.config(text=f"Detection failed: {exc}", fg=DANGER)
+            self._draw_preview()
+
+    def _source_pixel_width(self):
+        if self.source_page_points:
+            return self.source_page_points[0] / 72.0 * max(20.0, float(self.dpi_var.get()))
+        try:
+            with Image.open(self.source_path) as image:
+                return image.width
+        except Exception:
+            return self.analysis_image.width if self.analysis_image else 1
+
+    def _draw_preview(self):
+        canvas = self.preview_canvas
+        canvas.delete("all")
+        if self.analysis_image is None:
+            canvas.create_text(
+                max(1, canvas.winfo_width()) / 2,
+                max(1, canvas.winfo_height()) / 2,
+                text="Artwork preview",
+                fill="#777777",
+                font=("Segoe UI", 12, "bold"),
+            )
+            return
+
+        cw = max(80, canvas.winfo_width() - 30)
+        ch = max(80, canvas.winfo_height() - 30)
+        iw, ih = self.analysis_image.size
+        scale = min(cw / iw, ch / ih)
+        dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        x0 = (canvas.winfo_width() - dw) / 2
+        y0 = (canvas.winfo_height() - dh) / 2
+        shown = self.analysis_image.resize((dw, dh), Image.LANCZOS)
+        self._preview_photo = ImageTk.PhotoImage(shown)
+        canvas.create_image(x0, y0, anchor="nw", image=self._preview_photo)
+
+        for contour in self.analysis_contours:
+            coords = []
+            for x, y in contour:
+                coords.extend([x0 + x * scale, y0 + y * scale])
+            if len(coords) >= 6:
+                coords.extend(coords[:2])
+                canvas.create_line(*coords, fill="#FF0000", width=2, smooth=False)
+
+    def _reset_settings(self):
+        self.tolerance_var.set(15)
+        self.smoothing_var.set(0.5)
+        self.min_area_var.set(0.05)
+        self.offset_var.set(0.0)
+        self.include_holes_var.set(False)
+        self.line_width_var.set(0.25)
+        self._schedule_analysis()
+
+    def _source_size_mm(self):
+        if self.source_page_points:
+            return (
+                self.source_page_points[0] * 25.4 / 72.0,
+                self.source_page_points[1] * 25.4 / 72.0,
+            )
+        dpi = max(20.0, float(self.dpi_var.get()))
+        try:
+            with Image.open(self.source_path) as img:
+                width, height = ImageOps.exif_transpose(img).size
+        except Exception:
+            width, height = self.analysis_image.size
+        return width * 25.4 / dpi, height * 25.4 / dpi
+
+    def _export(self):
+        if not self.source_path or not self.analysis_contours:
+            messagebox.showwarning("Nothing to export", "No vector outline has been detected.", parent=self)
+            return
+
+        fmt = self.export_format_var.get().upper()
+        extension = ".pdf" if fmt == "PDF" else ".svg"
+        base_name = os.path.splitext(os.path.basename(self.source_path))[0] + "_cutline"
+        output = filedialog.asksaveasfilename(
+            title="Export vector cut line",
+            defaultextension=extension,
+            initialfile=base_name + extension,
+            filetypes=[(fmt, "*" + extension)],
+        )
+        if not output:
+            return
+
+        try:
+            if fmt == "PDF":
+                self._export_pdf(output)
+            else:
+                self._export_svg(output)
+            messagebox.showinfo("Export complete", f"Saved:\n{output}", parent=self)
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc), parent=self)
+
+    def _mapped_contours(self, width, height):
+        aw, ah = self.analysis_image.size
+        sx, sy = width / aw, height / ah
+        return [[(x * sx, y * sy) for x, y in contour] for contour in self.analysis_contours]
+
+    def _export_pdf(self, output):
+        width_mm, height_mm = self._source_size_mm()
+        width_pt, height_pt = width_mm * 72 / 25.4, height_mm * 72 / 25.4
+        doc = fitz.open()
+        page = doc.new_page(width=width_pt, height=height_pt)
+        artwork_ocg = doc.add_ocg("Artwork") if self.export_mode_var.get() == "artwork" else 0
+        cut_ocg = doc.add_ocg("Cut line")
+        rect = fitz.Rect(0, 0, width_pt, height_pt)
+
+        source_doc = None
+        if self.export_mode_var.get() == "artwork":
+            if os.path.splitext(self.source_path)[1].lower() == ".pdf":
+                source_doc = fitz.open(self.source_path)
+                page.show_pdf_page(rect, source_doc, 0, keep_proportion=False, oc=artwork_ocg)
+            else:
+                try:
+                    page.insert_image(rect, filename=self.source_path, keep_proportion=False, oc=artwork_ocg)
+                except Exception:
+                    # Unsupported image formats are converted losslessly without
+                    # resizing. PNG compression level 0 avoids additional work and
+                    # never introduces quality loss.
+                    with Image.open(self.source_path) as raw:
+                        raw = ImageOps.exif_transpose(raw)
+                        buffer = io.BytesIO()
+                        raw.save(buffer, format="PNG", compress_level=0)
+                    page.insert_image(rect, stream=buffer.getvalue(), keep_proportion=False, oc=artwork_ocg)
+
+        width = max(0.01, float(self.line_width_var.get())) * 72 / 25.4
+        for contour in self._mapped_contours(width_pt, height_pt):
+            page.draw_polyline(
+                [fitz.Point(x, y) for x, y in contour],
+                color=(1, 0, 0),
+                width=width,
+                closePath=True,
+                lineJoin=1,
+                lineCap=1,
+                oc=cut_ocg,
+            )
+
+        doc.save(output, garbage=4)
+        if source_doc is not None:
+            source_doc.close()
+        doc.close()
+
+    def _artwork_data_uri(self):
+        ext = os.path.splitext(self.source_path)[1].lower()
+        direct_types = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }
+        if ext in direct_types:
+            data = open(self.source_path, "rb").read()
+            return direct_types[ext], base64.b64encode(data).decode("ascii")
+
+        # SVG cannot directly contain a PDF page or every specialist image
+        # format. Convert losslessly to an unscaled PNG for the SVG Artwork group.
+        if ext == ".pdf":
+            doc = fitz.open(self.source_path)
+            page = doc[0]
+            dpi = max(72.0, float(self.dpi_var.get()))
+            pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=True)
+            image = Image.frombytes("RGBA", (pix.width, pix.height), pix.samples)
+            doc.close()
+        else:
+            image = ImageOps.exif_transpose(Image.open(self.source_path))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", compress_level=0)
+        return "image/png", base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    def _export_svg(self, output):
+        aw, ah = self.analysis_image.size
+        width_mm, height_mm = self._source_size_mm()
+        line_px = max(0.01, float(self.line_width_var.get())) / max(width_mm / aw, height_mm / ah)
+
+        parts = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+            f'width="{width_mm:.6f}mm" height="{height_mm:.6f}mm" viewBox="0 0 {aw} {ah}">',
+        ]
+
+        if self.export_mode_var.get() == "artwork":
+            mime, encoded = self._artwork_data_uri()
+            parts.extend([
+                '<g id="Artwork" inkscape:label="Artwork" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape">',
+                f'<image x="0" y="0" width="{aw}" height="{ah}" preserveAspectRatio="none" '
+                f'xlink:href="data:{mime};base64,{encoded}"/>',
+                '</g>',
+            ])
+
+        parts.append('<g id="Cut_line" inkscape:label="Cut line" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape">')
+        for contour in self.analysis_contours:
+            commands = [f'M {contour[0][0]:.3f} {contour[0][1]:.3f}']
+            commands.extend(f'L {x:.3f} {y:.3f}' for x, y in contour[1:])
+            commands.append('Z')
+            parts.append(
+                f'<path d="{" ".join(commands)}" fill="none" stroke="#FF0000" '
+                f'stroke-width="{line_px:.4f}" stroke-linejoin="round" stroke-linecap="round"/>'
+            )
+        parts.extend(['</g>', '</svg>'])
+        Path(output).write_text("\n".join(parts), encoding="utf-8")
+
+
 # ── Print Layout Tab ──────────────────────────────────────────────────────────
 DEFAULT_PRINT_LAYOUTS = {
     "Default": {"paper":"SRA4","orientation":"Portrait","item_w":210.0,"item_h":297.0,"cols":1,"rows":1,"mode":"In order","duplex":False,"bleed":False,"bleed_mm":2.0,"spacing":0.0,"grayscale":False,"brightness":100,"dpi":300,"cut_marks":False,"cut_labels":False},
@@ -1709,42 +2323,70 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         self.custom_sizes=load_custom_sizes(); self.paper_cb.config(values=self._paper_names())
     def _paper_names(self): return list(PAPER_SIZES_MM)+list(self.custom_sizes)
     def _build(self):
-        left=tk.Frame(self,bg=SURFACE,width=285); left.pack(side="left",fill="y",padx=(0,1)); left.pack_propagate(False)
+        # Three-column workspace: settings | imposed-sheet preview | source files.
+        self.grid_rowconfigure(0,weight=1)
+        self.grid_columnconfigure(0,weight=0)
+        self.grid_columnconfigure(1,weight=1)
+        self.grid_columnconfigure(2,weight=0)
+
+        # LEFT: settings stay visible and have their own scrollbar.
+        left_wrap=tk.Frame(self,bg=SURFACE,width=300)
+        left_wrap.grid(row=0,column=0,sticky="ns",padx=(0,1))
+        left_wrap.grid_propagate(False)
+        left_canvas=tk.Canvas(left_wrap,bg=SURFACE,highlightthickness=0,width=278)
+        left_scroll=ttk.Scrollbar(left_wrap,orient="vertical",command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scroll.set)
+        left_canvas.pack(side="left",fill="both",expand=True)
+        left_scroll.pack(side="right",fill="y")
+        left=tk.Frame(left_canvas,bg=SURFACE)
+        left_win=left_canvas.create_window((0,0),window=left,anchor="nw")
+        left.bind("<Configure>",lambda e:left_canvas.configure(scrollregion=left_canvas.bbox("all")))
+        left_canvas.bind("<Configure>",lambda e:left_canvas.itemconfig(left_win,width=e.width))
+        def left_wheel(event): left_canvas.yview_scroll(int(-event.delta/120),"units")
+        left_canvas.bind("<Enter>",lambda e:left_canvas.bind_all("<MouseWheel>",left_wheel))
+        left_canvas.bind("<Leave>",lambda e:left_canvas.unbind_all("<MouseWheel>"))
+
         lbl(left,"PRINT LAYOUT",8,MUTED,True).pack(pady=(12,4),padx=16,anchor="w")
         pr=tk.Frame(left,bg=SURFACE); pr.pack(fill="x",padx=16)
         self.layout_var=tk.StringVar(value="Default")
-        self.layout_cb=ttk.Combobox(pr,textvariable=self.layout_var,values=list(self.layouts),state="readonly",width=20); self.layout_cb.pack(side="left",fill="x",expand=True)
+        self.layout_cb=ttk.Combobox(pr,textvariable=self.layout_var,values=list(self.layouts),state="readonly",width=20)
+        self.layout_cb.pack(side="left",fill="x",expand=True)
         self.layout_cb.bind("<<ComboboxSelected>>",lambda e:self._load_layout(self.layout_var.get()))
         tk.Button(pr,text="Save",command=self._save_layout_dialog,bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2").pack(side="left",padx=(5,0))
+
         lbl(left,"Paper size").pack(padx=16,anchor="w",pady=(7,0))
-        self.paper_var=tk.StringVar(value="A4"); self.paper_cb=ttk.Combobox(left,textvariable=self.paper_var,values=self._paper_names(),state="readonly")
+        self.paper_var=tk.StringVar(value="A4")
+        self.paper_cb=ttk.Combobox(left,textvariable=self.paper_var,values=self._paper_names(),state="readonly")
         self.paper_cb.pack(fill="x",padx=16,pady=(2,3)); self.paper_cb.bind("<<ComboboxSelected>>",self._changed)
         rr=tk.Frame(left,bg=SURFACE); rr.pack(fill="x",padx=16)
         self.orientation_var=tk.StringVar(value="Portrait")
         for x in ("Portrait","Landscape"):
             tk.Radiobutton(rr,text=x,variable=self.orientation_var,value=x,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._changed).pack(side="left")
-        self.dpi_var=tk.IntVar(value=300); ttk.Combobox(rr,textvariable=self.dpi_var,values=[150,300,600],state="readonly",width=6).pack(side="right"); lbl(rr,"DPI",8,MUTED).pack(side="right",padx=4)
+        self.dpi_var=tk.IntVar(value=300)
+        ttk.Combobox(rr,textvariable=self.dpi_var,values=[150,300,600],state="readonly",width=6).pack(side="right")
+        lbl(rr,"DPI",8,MUTED).pack(side="right",padx=4)
+
         sep(left)
         grid_hdr=tk.Frame(left,bg=SURFACE); grid_hdr.pack(fill="x",padx=16)
         lbl(grid_hdr,"ITEM & GRID",8,MUTED,True).pack(side="left")
-        tk.Button(grid_hdr,text="Auto layout…",command=self._open_layout_calculator,
-            bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),
-            cursor="hand2",padx=7,pady=2).pack(side="right")
+        tk.Button(grid_hdr,text="Auto layout…",command=self._open_layout_calculator,bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2",padx=7,pady=2).pack(side="right")
         size_row=tk.Frame(left,bg=SURFACE); size_row.pack(fill="x",padx=16,pady=(3,0))
-        self.item_w=tk.DoubleVar(value=90); self.item_h=tk.DoubleVar(value=50); self.cols_var=tk.IntVar(value=2); self.rows_var=tk.IntVar(value=5)
+        self.item_w=tk.DoubleVar(value=90); self.item_h=tk.DoubleVar(value=50)
+        self.cols_var=tk.IntVar(value=2); self.rows_var=tk.IntVar(value=5)
         for i,(t,v) in enumerate((("Width",self.item_w),("Height",self.item_h))):
             f=tk.Frame(size_row,bg=SURFACE); f.pack(side="left",fill="x",expand=True,padx=(0 if i==0 else 4,0))
             lbl(f,t+" (mm)",7,MUTED).pack(anchor="w"); e=entry(f,v,7); e.pack(fill="x"); e.bind("<KeyRelease>",self._changed)
-        tk.Button(size_row,text="Presets…",command=self._open_item_size_presets,bg=SURFACE2,fg=TEXT,
-            relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2",padx=7,pady=4).pack(side="left",padx=(6,0),pady=(12,0))
+        tk.Button(size_row,text="Presets…",command=self._open_item_size_presets,bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2",padx=7,pady=4).pack(side="left",padx=(6,0),pady=(12,0))
         grid=tk.Frame(left,bg=SURFACE); grid.pack(fill="x",padx=16,pady=(4,0))
         for i,(t,v) in enumerate((("Columns",self.cols_var),("Rows",self.rows_var))):
             f=tk.Frame(grid,bg=SURFACE); f.grid(row=0,column=i,padx=(0 if i==0 else 4,0),sticky="ew"); grid.grid_columnconfigure(i,weight=1)
             lbl(f,t,7,MUTED).pack(anchor="w"); e=entry(f,v,7); e.pack(fill="x"); e.bind("<KeyRelease>",self._changed)
         mr=tk.Frame(left,bg=SURFACE); mr.pack(fill="x",padx=16,pady=(6,0)); self.mode_var=tk.StringVar(value="Repeat")
         for x in ("Repeat","Cut & stack","In order"):
-            tk.Radiobutton(mr,text=x,variable=self.mode_var,value=x,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._mode_changed).pack(side="left")
-        self.duplex_var=tk.BooleanVar(value=True); tk.Checkbutton(left,text="Double-sided (left bind)",variable=self.duplex_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",9),command=self._changed).pack(padx=16,anchor="w")
+            tk.Radiobutton(mr,text=x,variable=self.mode_var,value=x,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._mode_changed).pack(anchor="w")
+        self.duplex_var=tk.BooleanVar(value=True)
+        tk.Checkbutton(left,text="Double-sided (left bind)",variable=self.duplex_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",9),command=self._changed).pack(padx=16,anchor="w")
+
         sep(left); lbl(left,"SPACING & BLEED",8,MUTED,True).pack(padx=16,anchor="w")
         sr=tk.Frame(left,bg=SURFACE); sr.pack(fill="x",padx=16,pady=(3,0)); lbl(sr,"Trim spacing (mm)",8).pack(side="left")
         self.spacing_var=tk.DoubleVar(value=6); e=entry(sr,self.spacing_var,6); e.pack(side="right"); e.bind("<KeyRelease>",self._changed)
@@ -1752,32 +2394,76 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         tk.Checkbutton(br,text="Add bleed",variable=self.bleed_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",9),command=self._toggle_bleed).pack(side="left")
         self.bleed_mm=tk.DoubleVar(value=3); self.bleed_entry=entry(br,self.bleed_mm,6); self.bleed_entry.pack(side="right"); self.bleed_entry.bind("<KeyRelease>",self._changed); lbl(br,"mm",8,MUTED).pack(side="right",padx=3)
         cr=tk.Frame(left,bg=SURFACE); cr.pack(fill="x",padx=16,pady=(3,0))
-        self.cut_marks_var=tk.BooleanVar(value=False)
-        self.cut_labels_var=tk.BooleanVar(value=False)
-        tk.Checkbutton(cr,text="Cut marks",variable=self.cut_marks_var,bg=SURFACE,fg=TEXT,
-            selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),
-            command=self._toggle_cut_marks).pack(side="left")
-        self.cut_labels_chk=tk.Checkbutton(cr,text="Distance labels",variable=self.cut_labels_var,
-            bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,
-            font=("Segoe UI",8),command=self._changed)
+        self.cut_marks_var=tk.BooleanVar(value=False); self.cut_labels_var=tk.BooleanVar(value=False)
+        tk.Checkbutton(cr,text="Cut marks",variable=self.cut_marks_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._toggle_cut_marks).pack(side="left")
+        self.cut_labels_chk=tk.Checkbutton(cr,text="Distance labels",variable=self.cut_labels_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._changed)
         self.cut_labels_chk.pack(side="right")
+
         sep(left); lbl(left,"IMAGE ADJUSTMENTS",8,MUTED,True).pack(padx=16,anchor="w")
-        self.gray_var=tk.BooleanVar(value=False); tk.Checkbutton(left,text="Grayscale",variable=self.gray_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",9),command=self._effects_changed).pack(padx=16,anchor="w")
+        self.gray_var=tk.BooleanVar(value=False)
+        tk.Checkbutton(left,text="Grayscale",variable=self.gray_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",9),command=self._effects_changed).pack(padx=16,anchor="w")
         self.brightness_var=tk.IntVar(value=100); self.brightness_lbl=lbl(left,"Brightness: 100%",8); self.brightness_lbl.pack(padx=16,anchor="w")
         ttk.Scale(left,from_=25,to=175,variable=self.brightness_var,orient="horizontal",command=self._brightness_changed).pack(fill="x",padx=16)
         self.fit_lbl=lbl(left,"",8,MUTED); self.fit_lbl.pack(padx=16,anchor="w",pady=(3,1))
-        ar=tk.Frame(left,bg=SURFACE); ar.pack(fill="x",padx=16,pady=2)
-        styled_btn(ar,"➕ Add",self._add_files).pack(side="left",fill="x",expand=True,padx=(0,3)); styled_btn(ar,"🗑 Clear",self._clear,style="secondary").pack(side="left",fill="x",expand=True,padx=(3,0))
-        self.export_btn=styled_btn(left,"Export PDF",self._export_pdf,style="success"); self.export_btn.pack(fill="x",padx=16,pady=3)
-        self.status=lbl(left,"",8,MUTED); self.status.pack(padx=16,anchor="w")
-        right=tk.Frame(self,bg=BG); right.pack(side="left",fill="both",expand=True)
-        self.drop_zone=tk.Label(right,text="⬇  Drop images or multi-page PDFs here",bg=SURFACE2,fg=MUTED,font=("Segoe UI",10),pady=9,cursor="hand2"); self.drop_zone.pack(fill="x",padx=12,pady=(8,0)); self.drop_zone.bind("<Button-1>",lambda e:self._add_files()); self.setup_drop(self.drop_zone,self._drop_files,IMAGE_EXTS | {".pdf"})
-        body=tk.Frame(right,bg=BG); body.pack(fill="both",expand=True,padx=12,pady=8)
-        self.sheet_preview=tk.Canvas(body,bg=SURFACE2,highlightthickness=0,width=250); self.sheet_preview.pack(side="left",fill="y",padx=(0,8)); self.sheet_preview.bind("<Configure>",lambda e:self._schedule_preview())
-        self.cards_canvas=tk.Canvas(body,bg=BG,highlightthickness=0); self.cards_canvas.pack(side="left",fill="both",expand=True)
-        self.cards_frame=tk.Frame(self.cards_canvas,bg=BG); self.cards_win=self.cards_canvas.create_window((0,0),window=self.cards_frame,anchor="nw")
-        self.cards_frame.bind("<Configure>",lambda e:self.cards_canvas.configure(scrollregion=self.cards_canvas.bbox("all"))); self.cards_canvas.bind("<Configure>",lambda e:self.cards_canvas.itemconfig(self.cards_win,width=e.width))
-        self.cards_canvas.bind("<Enter>",lambda e:self.cards_canvas.bind_all("<MouseWheel>",lambda ev:self.cards_canvas.yview_scroll(int(-ev.delta/120),"units"))); self.cards_canvas.bind("<Leave>",lambda e:self.cards_canvas.unbind_all("<MouseWheel>")); self.setup_drop(self.cards_canvas,self._drop_files,IMAGE_EXTS | {".pdf"})
+        self.export_btn=styled_btn(left,"Export PDF",self._export_pdf,style="success"); self.export_btn.pack(fill="x",padx=16,pady=(8,3))
+        styled_btn(left,"Print current layout  (Ctrl+P)",self._print_current_layout,style="secondary").pack(fill="x",padx=16,pady=3)
+        self.status=lbl(left,"",8,MUTED); self.status.pack(padx=16,anchor="w",pady=(0,12))
+
+        # MIDDLE: largest area, independently scrollable final-sheet previews.
+        preview_panel=tk.Frame(self,bg=BG)
+        preview_panel.grid(row=0,column=1,sticky="nsew",padx=10,pady=8)
+        preview_panel.grid_rowconfigure(1,weight=1); preview_panel.grid_columnconfigure(0,weight=1)
+        ph=tk.Frame(preview_panel,bg=BG); ph.grid(row=0,column=0,sticky="ew",pady=(0,6))
+        lbl(ph,"FINAL IMPOSED SHEETS",9,MUTED,True).pack(side="left")
+        self.preview_count_lbl=lbl(ph,"0 sheets",8,MUTED); self.preview_count_lbl.pack(side="right")
+        preview_body=tk.Frame(preview_panel,bg=BG)
+        preview_body.grid(row=1,column=0,sticky="nsew")
+        preview_body.grid_rowconfigure(0,weight=1); preview_body.grid_columnconfigure(0,weight=1)
+        self.preview_canvas=tk.Canvas(preview_body,bg=SURFACE2,highlightthickness=0)
+        preview_v=ttk.Scrollbar(preview_body,orient="vertical",command=self.preview_canvas.yview)
+        preview_h=ttk.Scrollbar(preview_body,orient="horizontal",command=self.preview_canvas.xview)
+        self.preview_canvas.configure(yscrollcommand=preview_v.set,xscrollcommand=preview_h.set)
+        self.preview_canvas.grid(row=0,column=0,sticky="nsew"); preview_v.grid(row=0,column=1,sticky="ns"); preview_h.grid(row=1,column=0,sticky="ew")
+        self.preview_frame=tk.Frame(self.preview_canvas,bg=SURFACE2)
+        self.preview_window=self.preview_canvas.create_window((0,0),window=self.preview_frame,anchor="nw")
+        self.preview_frame.bind("<Configure>",lambda e:self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all")))
+        self.preview_canvas.bind("<Configure>",lambda e:(self.preview_canvas.itemconfig(self.preview_window,width=e.width),self._schedule_preview()))
+        def preview_wheel(event): self.preview_canvas.yview_scroll(int(-event.delta/120),"units")
+        self.preview_canvas.bind("<Enter>",lambda e:self.preview_canvas.bind_all("<MouseWheel>",preview_wheel))
+        self.preview_canvas.bind("<Leave>",lambda e:self.preview_canvas.unbind_all("<MouseWheel>"))
+        self.setup_drop(self.preview_canvas,self._drop_files,IMAGE_EXTS | {".pdf"})
+        self.preview_images=[]
+
+        # RIGHT: compact source-file controls and crop cards; drop zone stays at bottom.
+        files_panel=tk.Frame(self,bg=SURFACE,width=260)
+        files_panel.grid(row=0,column=2,sticky="ns",padx=(1,0))
+        files_panel.grid_propagate(False)
+        lbl(files_panel,"SOURCE FILES",8,MUTED,True).pack(anchor="w",padx=10,pady=(12,4))
+        actions=tk.Frame(files_panel,bg=SURFACE); actions.pack(fill="x",padx=10,pady=(0,5))
+        styled_btn(actions,"Add",self._add_files).pack(side="left",fill="x",expand=True,padx=(0,3))
+        styled_btn(actions,"Clear",self._clear,style="secondary").pack(side="left",fill="x",expand=True,padx=(3,0))
+        cards_wrap=tk.Frame(files_panel,bg=SURFACE); cards_wrap.pack(fill="both",expand=True,padx=6)
+        self.cards_canvas=tk.Canvas(cards_wrap,bg=SURFACE,highlightthickness=0)
+        cards_scroll=ttk.Scrollbar(cards_wrap,orient="vertical",command=self.cards_canvas.yview)
+        self.cards_canvas.configure(yscrollcommand=cards_scroll.set)
+        self.cards_canvas.pack(side="left",fill="both",expand=True); cards_scroll.pack(side="right",fill="y")
+        self.cards_frame=tk.Frame(self.cards_canvas,bg=SURFACE)
+        self.cards_win=self.cards_canvas.create_window((0,0),window=self.cards_frame,anchor="nw")
+        self.cards_frame.bind("<Configure>",lambda e:self.cards_canvas.configure(scrollregion=self.cards_canvas.bbox("all")))
+        self.cards_canvas.bind("<Configure>",lambda e:self.cards_canvas.itemconfig(self.cards_win,width=e.width))
+        def cards_wheel(event): self.cards_canvas.yview_scroll(int(-event.delta/120),"units")
+        self.cards_canvas.bind("<Enter>",lambda e:self.cards_canvas.bind_all("<MouseWheel>",cards_wheel))
+        self.cards_canvas.bind("<Leave>",lambda e:self.cards_canvas.unbind_all("<MouseWheel>"))
+        self.setup_drop(self.cards_canvas,self._drop_files,IMAGE_EXTS | {".pdf"})
+        self.drop_zone=tk.Label(files_panel,text="⬇  Drop images or multi-page PDFs",bg=SURFACE2,fg=MUTED,font=("Segoe UI",9),pady=12,cursor="hand2")
+        self.drop_zone.pack(fill="x",side="bottom",padx=8,pady=8)
+        self.drop_zone.bind("<Button-1>",lambda e:self._add_files())
+        self.setup_drop(self.drop_zone,self._drop_files,IMAGE_EXTS | {".pdf"})
+
+        # Ctrl+P is active while this tab exists. The handler ignores keystrokes
+        # when focus is inside an Entry so normal text editing still works.
+        self.bind_all("<Control-p>",self._ctrl_p)
+        self.bind_all("<Control-P>",self._ctrl_p)
         self._show_empty()
     def _num(self,var,default):
         try:return float(var.get())
@@ -1880,46 +2566,52 @@ class PrintLayoutTab(tk.Frame,DropMixin):
             except:pass
         self._preview_job=self.after(80,self._draw_preview)
     def _draw_preview(self):
-        self._preview_job=None; c=self.sheet_preview; c.delete("all")
-        try:pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,gw,gh=self._metrics()
-        except:return
-        cw=max(140,c.winfo_width()); ch=max(200,c.winfo_height()); sc=min((cw-24)/pw,(ch-40)/ph); ox=(cw-pw*sc)/2; oy=(ch-ph*sc)/2
-        c.create_rectangle(ox,oy,ox+pw*sc,oy+ph*sc,fill="white",outline=BORDER); fits=gw<=pw+1e-6 and gh<=ph+1e-6; self.fit_lbl.config(text=(f"Centered: {gw:.1f} × {gh:.1f} mm" if fits else f"Does not fit: {gw:.1f} × {gh:.1f} mm"),fg=MUTED if fits else DANGER)
-        for r in range(rows):
-            for col in range(cols):
-                tx=x0+col*(iw+gap); ty=y0+r*(ih+gap); bx=tx-bleed; by=ty-bleed
-                c.create_rectangle(ox+bx*sc,oy+by*sc,ox+(bx+iw+2*bleed)*sc,oy+(by+ih+2*bleed)*sc,fill="#D8D8E8",outline=ACCENT if bleed else BORDER)
-                c.create_rectangle(ox+tx*sc,oy+ty*sc,ox+(tx+iw)*sc,oy+(ty+ih)*sc,outline="#111")
-        if self.cut_marks_var.get():
-            xs=sorted(set([x0+cidx*(iw+gap) for cidx in range(cols)]+[x0+cidx*(iw+gap)+iw for cidx in range(cols)]))
-            ys=sorted(set([y0+ridx*(ih+gap) for ridx in range(rows)]+[y0+ridx*(ih+gap)+ih for ridx in range(rows)]))
-            safe_mm=4.0; desired_mm=5.0; artwork_gap_mm=1.0
-            top_limit=max(safe_mm, y0-bleed-artwork_gap_mm)
-            bottom_limit=min(ph-safe_mm, y0+gh+artwork_gap_mm)
-            left_limit=max(safe_mm, x0-bleed-artwork_gap_mm)
-            right_limit=min(pw-safe_mm, x0+gw+artwork_gap_mm)
-            top_len=max(0,min(desired_mm,top_limit-safe_mm)); bottom_len=max(0,min(desired_mm,ph-safe_mm-bottom_limit))
-            left_len=max(0,min(desired_mm,left_limit-safe_mm)); right_len=max(0,min(desired_mm,pw-safe_mm-right_limit))
-            label_font=("Segoe UI",9,"bold"); label_gap=max(3,1.2*sc)
-            for x in xs:
-                xx=ox+x*sc
-                if top_len>0:
-                    y1=oy+safe_mm*sc; y2=y1+top_len*sc; c.create_line(xx,y1,xx,y2,fill="#111")
-                    if self.cut_labels_var.get(): c.create_text(xx+label_gap,(y1+y2)/2,text=f"{min(x,pw-x):.1f}",font=label_font,fill="#111",angle=90)
-                if bottom_len>0:
-                    y2=oy+(ph-safe_mm)*sc; y1=y2-bottom_len*sc; c.create_line(xx,y1,xx,y2,fill="#111")
-                    if self.cut_labels_var.get(): c.create_text(xx+label_gap,(y1+y2)/2,text=f"{min(x,pw-x):.1f}",font=label_font,fill="#111",angle=90)
-            for y in ys:
-                yy=oy+y*sc
-                if left_len>0:
-                    x1=ox+safe_mm*sc; x2=x1+left_len*sc; c.create_line(x1,yy,x2,yy,fill="#111")
-                    if self.cut_labels_var.get(): c.create_text((x1+x2)/2,yy-label_gap,text=f"{min(y,ph-y):.1f}",font=label_font,fill="#111")
-                if right_len>0:
-                    x2=ox+(pw-safe_mm)*sc; x1=x2-right_len*sc; c.create_line(x1,yy,x2,yy,fill="#111")
-                    if self.cut_labels_var.get(): c.create_text((x1+x2)/2,yy-label_gap,text=f"{min(y,ph-y):.1f}",font=label_font,fill="#111")
+        self._preview_job=None
+        for child in self.preview_frame.winfo_children(): child.destroy()
+        self.preview_images.clear()
+        try:
+            pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,gw,gh=self._metrics()
+        except Exception:
+            return
+        fits=gw<=pw+1e-6 and gh<=ph+1e-6
+        self.fit_lbl.config(text=(f"Centered: {gw:.1f} × {gh:.1f} mm" if fits else f"Does not fit: {gw:.1f} × {gh:.1f} mm"),fg=MUTED if fits else DANGER)
+        if not self.files or not self.canvases:
+            self.preview_count_lbl.config(text="0 sheets")
+            tk.Label(self.preview_frame,text="Add source files to see the final imposed sheets",bg=SURFACE2,fg=MUTED,font=("Segoe UI",12)).grid(row=0,column=0,pady=70,padx=30)
+            return
+        if not fits:
+            self.preview_count_lbl.config(text="Layout does not fit")
+            tk.Label(self.preview_frame,text="The current grid is larger than the selected paper.",bg=SURFACE2,fg=DANGER,font=("Segoe UI",11,"bold")).grid(row=0,column=0,pady=70,padx=30)
+            return
+        specs=self._page_specs()
+        self.preview_count_lbl.config(text=f"{len(specs)} sheet{'s' if len(specs)!=1 else ''}")
+        available=max(320,self.preview_canvas.winfo_width()-30)
+        # Never exceed four columns. Smaller windows naturally reduce the count.
+        ncols=max(1,min(4,available//245))
+        card_w=max(190,min(330,(available-(ncols-1)*12)//ncols-14))
+        for idx,(assignments,back,label) in enumerate(specs):
+            r,col=divmod(idx,ncols)
+            card=tk.Frame(self.preview_frame,bg=BG,padx=5,pady=5)
+            card.grid(row=r,column=col,padx=6,pady=6,sticky="n")
+            try:
+                # Rendering at 55 DPI is enough for a clear on-screen preview and
+                # stays responsive even when many imposed pages are shown.
+                sheet=self._sheet(assignments,back=back,dpi_override=55)
+                max_h=420
+                scale=min(card_w/sheet.width,max_h/sheet.height,1.0)
+                shown=sheet.resize((max(1,int(sheet.width*scale)),max(1,int(sheet.height*scale))),Image.LANCZOS)
+                photo=ImageTk.PhotoImage(shown)
+                self.preview_images.append(photo)
+                tk.Label(card,image=photo,bg=BG,bd=1,relief="solid").pack()
+                tk.Label(card,text=label,bg=BG,fg=TEXT,font=("Segoe UI",8,"bold"),wraplength=card_w).pack(fill="x",pady=(4,0))
+            except Exception as ex:
+                tk.Label(card,text=f"Preview failed\n{ex}",bg=BG,fg=DANGER,font=("Segoe UI",8),wraplength=card_w).pack(padx=8,pady=20)
+        for col in range(ncols): self.preview_frame.grid_columnconfigure(col,weight=1)
+        self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all"))
     def _show_empty(self):
-        for w in self.cards_frame.winfo_children():w.destroy()
-        tk.Label(self.cards_frame,text="No images loaded\n\nDrop images here or click Add",bg=BG,fg=MUTED,font=("Segoe UI",12)).pack(pady=50); self._schedule_preview()
+        for w in self.cards_frame.winfo_children(): w.destroy()
+        tk.Label(self.cards_frame,text="No files loaded",bg=SURFACE,fg=MUTED,font=("Segoe UI",10)).pack(pady=35)
+        self._schedule_preview()
     def _add_files(self):
         exts=" ".join(f"*{e}" for e in (IMAGE_EXTS | {".pdf"}))
         self._drop_files(list(filedialog.askopenfilenames(filetypes=[("Images and PDFs",exts),("All","*.*")])))
@@ -1932,7 +2624,7 @@ class PrintLayoutTab(tk.Frame,DropMixin):
                     doc=fitz.open(p)
                     for page_no in range(len(doc)):
                         key=f"{p}::page::{page_no}"
-                        if key in self.files: continue
+                        if any(self.pdf_sources.get(existing)==(p,page_no) for existing in self.files): continue
                         page=doc[page_no]; pix=page.get_pixmap(matrix=fitz.Matrix(100/72,100/72),alpha=False)
                         img=Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
                         preview=os.path.join(self._temp_dir,f"pdf_{abs(hash(key))}_{page_no+1}.png"); img.save(preview,"PNG")
@@ -1947,18 +2639,36 @@ class PrintLayoutTab(tk.Frame,DropMixin):
     def _remove(self,path):
         if path in self.files:self.files.remove(path)
         self.pdf_sources.pop(path,None); self.display_names.pop(path,None); self._rebuild()
+    def _move_source(self,path,direction):
+        if path not in self.files:return
+        i=self.files.index(path); j=i+direction
+        if 0<=j<len(self.files):
+            self.files[i],self.files[j]=self.files[j],self.files[i]
+            self._rebuild()
     def _rebuild(self):
         for w in self.cards_frame.winfo_children():w.destroy()
         self.canvases.clear()
         if not self.files:self._show_empty();return
-        dpi=int(self.dpi_var.get()); tw=mm_to_px(max(.1,self._num(self.item_w,90)),dpi); th=mm_to_px(max(.1,self._num(self.item_h,50)),dpi); avail=max(400,self.cards_canvas.winfo_width()); ncols=3 if avail>700 else 2; thumb=max(150,min(230,avail//ncols-28))
+        dpi=int(self.dpi_var.get()); tw=mm_to_px(max(.1,self._num(self.item_w,90)),dpi); th=mm_to_px(max(.1,self._num(self.item_h,50)),dpi)
         for i,path in enumerate(self.files):
-            r,col=divmod(i,ncols); cell=tk.Frame(self.cards_frame,bg=SURFACE2,padx=6,pady=6); cell.grid(row=r,column=col,padx=6,pady=6,sticky="n")
+            cell=tk.Frame(self.cards_frame,bg=SURFACE2,padx=5,pady=5)
+            cell.pack(fill="x",padx=4,pady=4)
             try:
-                cc=PrintCropCanvas(cell,path,tw,th,size=(thumb,thumb)); cc.pack(); cc.set_effects(self.gray_var.get(),self.brightness_var.get()); self.canvases.append((path,cc))
-                tk.Label(cell,text=self.display_names.get(path,os.path.basename(path))[:36],bg=SURFACE2,fg=MUTED,font=("Segoe UI",8)).pack(); acts=tk.Frame(cell,bg=SURFACE2); acts.pack(fill="x",pady=(3,0))
-                for t,cmd in (("⟲",lambda c=cc:c.rotate_manual(90)),("⟳",lambda c=cc:c.rotate_manual(-90)),("✕",lambda p=path:self._remove(p))): tk.Button(acts,text=t,command=cmd,bg=SURFACE,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2").pack(side="left",fill="x",expand=True,padx=1)
-            except Exception as ex: tk.Label(cell,text=str(ex)[:45],bg=SURFACE2,fg=DANGER).pack()
+                cc=PrintCropCanvas(cell,path,tw,th,size=(205,135)); cc.pack()
+                cc.set_effects(self.gray_var.get(),self.brightness_var.get()); self.canvases.append((path,cc))
+                tk.Label(cell,text=self.display_names.get(path,os.path.basename(path)),bg=SURFACE2,fg=MUTED,font=("Segoe UI",8),wraplength=210,justify="left").pack(fill="x",pady=(3,0))
+                acts=tk.Frame(cell,bg=SURFACE2); acts.pack(fill="x",pady=(3,0))
+                buttons=(
+                    ("↑",lambda p=path:self._move_source(p,-1)),
+                    ("↓",lambda p=path:self._move_source(p,1)),
+                    ("⟲",lambda c=cc:c.rotate_manual(90)),
+                    ("⟳",lambda c=cc:c.rotate_manual(-90)),
+                    ("✕",lambda p=path:self._remove(p)),
+                )
+                for t,cmd in buttons:
+                    tk.Button(acts,text=t,command=cmd,bg=SURFACE,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2").pack(side="left",fill="x",expand=True,padx=1)
+            except Exception as ex:
+                tk.Label(cell,text=str(ex)[:70],bg=SURFACE2,fg=DANGER,wraplength=210).pack()
         self._schedule_preview()
     def _current_layout(self):
         return {"paper":self.paper_var.get(),"orientation":self.orientation_var.get(),"item_w":self._num(self.item_w,90),"item_h":self._num(self.item_h,50),"cols":int(self._num(self.cols_var,2)),"rows":int(self._num(self.rows_var,5)),"mode":self.mode_var.get(),"duplex":self.duplex_var.get(),"bleed":self.bleed_var.get(),"bleed_mm":self._num(self.bleed_mm,3),"spacing":self._num(self.spacing_var,6),"grayscale":self.gray_var.get(),"brightness":int(self.brightness_var.get()),"dpi":int(self.dpi_var.get()),"cut_marks":self.cut_marks_var.get(),"cut_labels":self.cut_labels_var.get()}
@@ -2003,8 +2713,8 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         target=(mm_to_px(iw,dpi),mm_to_px(ih,dpi))
         img=self._processed(path,cc,target_px=target).resize(target,Image.LANCZOS)
         return add_bleed_and_marks(img,bleed,dpi,False) if bleed>0 else img
-    def _sheet(self,assignments,back=False):
-        pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,gw,gh=self._metrics(); dpi=int(self.dpi_var.get()); sheet=Image.new("RGB",(mm_to_px(pw,dpi),mm_to_px(ph,dpi)),"white"); by={p:c for p,c in self.canvases}
+    def _sheet(self,assignments,back=False,dpi_override=None):
+        pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,gw,gh=self._metrics(); dpi=int(dpi_override or self.dpi_var.get()); sheet=Image.new("RGB",(mm_to_px(pw,dpi),mm_to_px(ph,dpi)),"white"); by={p:c for p,c in self.canvases}
         for slot,path in enumerate(assignments):
             if not path or path not in by:continue
             row=slot//cols; col=slot%cols
@@ -2083,31 +2793,89 @@ class PrintLayoutTab(tk.Frame,DropMixin):
                 x2=sw-safe; x1=x2-right_len
                 draw.line((x1,py,x2,py),fill="black",width=lw)
                 if self.cut_labels_var.get(): draw_horizontal_label((x1+x2)/2,py,txt,right_len)
-    def _pages(self):
+    def _page_specs(self):
         slots=max(1,int(self.cols_var.get())*int(self.rows_var.get()))
-        mode=self.mode_var.get(); duplex=self.duplex_var.get(); pages=[]
+        mode=self.mode_var.get(); duplex=self.duplex_var.get(); specs=[]
+        sheet_no=1
         if mode=="Repeat":
             step=2 if duplex else 1
             for i in range(0,len(self.files),step):
-                pages.append(self._sheet([self.files[i]]*slots))
-                if duplex: pages.append(self._sheet([self.files[i+1] if i+1<len(self.files) else None]*slots,True))
+                specs.append(([self.files[i]]*slots,False,f"Sheet {sheet_no} — front" if duplex else f"Sheet {sheet_no}"))
+                if duplex:
+                    back_path=self.files[i+1] if i+1<len(self.files) else None
+                    specs.append(([back_path]*slots,True,f"Sheet {sheet_no} — back"))
+                sheet_no+=1
         elif mode=="Cut & stack":
-            # Cut-and-stack is duplex by default: each consecutive pair is front/back.
             pairs=[self.files[i:i+2] for i in range(0,len(self.files),2)]
-            ns=math.ceil(len(pairs)/slots)
+            ns=math.ceil(len(pairs)/slots) if pairs else 0
             for p in range(ns):
                 front=[]; back=[]
                 for s in range(slots):
                     idx=s*ns+p; pair=pairs[idx] if idx<len(pairs) else []
                     front.append(pair[0] if pair else None)
                     back.append(pair[1] if len(pair)>1 else None)
-                pages.append(self._sheet(front))
-                pages.append(self._sheet(back,True))
-        else:  # In order: simple one-sided placement in queue order.
+                specs.append((front,False,f"Sheet {sheet_no} — front"))
+                specs.append((back,True,f"Sheet {sheet_no} — back"))
+                sheet_no+=1
+        else:
             for i in range(0,len(self.files),slots):
                 chunk=self.files[i:i+slots]+[None]*max(0,slots-len(self.files[i:i+slots]))
-                pages.append(self._sheet(chunk))
-        return pages
+                specs.append((chunk,False,f"Sheet {sheet_no}")); sheet_no+=1
+        return specs
+    def _pages(self):
+        return [self._sheet(assignments,back=back) for assignments,back,_label in self._page_specs()]
+    def _ctrl_p(self,event=None):
+        focused=self.focus_get()
+        if isinstance(focused,(tk.Entry,ttk.Entry,tk.Text)):
+            return None
+        self._print_current_layout()
+        return "break"
+    def _print_current_layout(self):
+        if not self.canvases:
+            messagebox.showwarning("Nothing to print","Add images or PDF pages first.")
+            return
+        pw,ph,*rest=self._metrics(); gw,gh=rest[-2:]
+        if gw>pw+1e-6 or gh>ph+1e-6:
+            messagebox.showerror("Layout does not fit","The centered grid is larger than the selected paper.")
+            return
+        self.status.config(text="Preparing print PDF…",fg=MUTED)
+        threading.Thread(target=self._prepare_print_pdf,daemon=True).start()
+    def _prepare_print_pdf(self):
+        try:
+            out=os.path.join(tempfile.gettempdir(),f"CopyPro_Print_{int(time.time())}.pdf")
+            pages=self._pages(); dpi=int(self.dpi_var.get())
+            pages[0].save(out,"PDF",save_all=True,append_images=pages[1:],resolution=dpi,quality=100,subsampling=0,optimize=False)
+            self.after(0,lambda p=out:self._open_acrobat_print(p))
+        except Exception as ex:
+            self.after(0,lambda e=ex:messagebox.showerror("Print failed",str(e)))
+            self.after(0,lambda:self.status.config(text="Print preparation failed",fg=DANGER))
+    def _open_acrobat_print(self,pdf_path):
+        self.status.config(text="Opening Acrobat print dialog…",fg=SUCCESS)
+        if not sys.platform.startswith("win"):
+            try: subprocess.Popen([pdf_path])
+            except Exception: pass
+            return
+        candidates=[
+            os.path.expandvars(r"%ProgramFiles%\Adobe\Acrobat DC\Acrobat\Acrobat.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Adobe\Reader 11.0\Reader\AcroRd32.exe"),
+        ]
+        exe=next((p for p in candidates if p and os.path.exists(p)),None)
+        try:
+            if exe:
+                subprocess.Popen([exe,pdf_path])
+            else:
+                os.startfile(pdf_path)
+            # Acrobat has no reliable documented command that only opens its print
+            # dialog. Activate it after opening and send Ctrl+P as a best-effort step.
+            ps=("Start-Sleep -Milliseconds 1400; "
+                "$w=New-Object -ComObject WScript.Shell; "
+                "if($w.AppActivate('Adobe Acrobat') -or $w.AppActivate('Adobe Acrobat Reader'))"
+                "{Start-Sleep -Milliseconds 250; $w.SendKeys('^p')}")
+            subprocess.Popen(["powershell","-NoProfile","-WindowStyle","Hidden","-Command",ps],creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+        except Exception as ex:
+            messagebox.showerror("Print failed",f"The PDF was created, but Acrobat could not be opened.\n\n{ex}\n\nFile: {pdf_path}")
     def _export_pdf(self):
         if not self.canvases:messagebox.showwarning("Nothing to export","Add images first.");return
         pw,ph,*rest=self._metrics(); gw,gh=rest[-2:]
@@ -2124,6 +2892,9 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         finally:self.after(0,lambda:self.export_btn.config(state="normal"))
 
     def destroy(self):
+        try:
+            self.unbind_all("<Control-p>"); self.unbind_all("<Control-P>")
+        except Exception: pass
         try: shutil.rmtree(self._temp_dir,ignore_errors=True)
         except Exception: pass
         super().destroy()
@@ -2944,23 +3715,59 @@ def _copy_default_if_missing(destination, bundled_name):
     if os.path.exists(destination): return
     os.makedirs(os.path.dirname(os.path.abspath(destination)),exist_ok=True)
     bundled=resource_path(bundled_name)
+    if not os.path.exists(bundled): bundled=resource_path(os.path.join("data",bundled_name))
     if os.path.exists(bundled): shutil.copy2(bundled,destination)
 
-def _ensure_editable_files():
-    paths=_editable_paths()
-    _copy_default_if_missing(paths["codes_file"],"copypro_kodai.csv")
-    _copy_default_if_missing(paths["paper_sizes_file"],"copypro_popieriaus_dydziai.csv")
+def _normalise_excel_value(value):
+    return "" if value is None else value
+
+def _xlsx_rows(path, sheet_name):
+    wb=load_workbook(path,read_only=True,data_only=True)
+    try:
+        ws=wb[sheet_name] if sheet_name in wb.sheetnames else wb[wb.sheetnames[0]]
+        iterator=ws.iter_rows(values_only=True)
+        headers=[str(x).strip() if x is not None else "" for x in next(iterator)]
+        result=[]
+        for values in iterator:
+            row={headers[i]:_normalise_excel_value(values[i]) if i<len(values) else "" for i in range(len(headers)) if headers[i]}
+            if any(str(v).strip() for v in row.values()): result.append(row)
+        return result
+    finally: wb.close()
 
 def _csv_rows(path):
     with open(path,"r",encoding="utf-8-sig",newline="") as f:
-        return list(csv.DictReader(f))
+        sample=f.read(4096); f.seek(0)
+        try: dialect=csv.Sniffer().sniff(sample,delimiters=",;\t")
+        except Exception: dialect=csv.excel
+        return list(csv.DictReader(f,dialect=dialect))
+
+def _data_rows(path, sheet_name):
+    return _xlsx_rows(path,sheet_name) if os.path.splitext(path)[1].lower() in (".xlsx",".xlsm") else _csv_rows(path)
+
+def _write_sizes_workbook(path, rows):
+    # Preserve the Instructions sheet and workbook formatting when possible.
+    if os.path.exists(path) and os.path.splitext(path)[1].lower() in (".xlsx",".xlsm"):
+        wb=load_workbook(path)
+        ws=wb["Sizes"] if "Sizes" in wb.sheetnames else wb[wb.sheetnames[0]]
+        if ws.max_row>1: ws.delete_rows(2,ws.max_row-1)
+    else:
+        wb=Workbook(); ws=wb.active; ws.title="Sizes"
+        ws.append(["group","name","width_mm","height_mm","active","is_custom","notes_lt"])
+    fields=["group","name","width_mm","height_mm","active","is_custom","notes_lt"]
+    for row in rows: ws.append([row.get(field,"") for field in fields])
+    wb.save(path)
+
+def _ensure_editable_files():
+    paths=_editable_paths()
+    _copy_default_if_missing(paths["codes_file"],"copypro_kodai.xlsx")
+    _copy_default_if_missing(paths["paper_sizes_file"],"copypro_popieriaus_dydziai.xlsx")
 
 def reload_editable_data():
     global PAPER_SIZES_MM, WIDE_FORMAT_ITEMS, PLU_SEARCH_ALIASES
     _ensure_editable_files(); paths=_editable_paths()
     PLU_DESCRIPTIONS.clear(); PLU_PRICES.clear(); WIDE_FORMAT_ITEMS={}; PLU_SEARCH_ALIASES={}
     coverage_to_internal={"dalinis":"partial","pilnas":"full","brėžinys":"drawing","brezinys":"drawing","fiksuotas":"fixed"}
-    for item in _csv_rows(paths["codes_file"]):
+    for item in _data_rows(paths["codes_file"],"Items"):
         if str(item.get("active","taip")).strip().lower() not in ("taip","yes","1","true"): continue
         code=str(item.get("code","")).strip(); name=str(item.get("name_lt","")).strip()
         if not code or not name: continue
@@ -2973,10 +3780,9 @@ def reload_editable_data():
         raw_coverage=str(item.get("wide_format_coverage","")).strip().lower()
         coverage=coverage_to_internal.get(raw_coverage,raw_coverage)
         label=str(item.get("wide_format_label_lt","")).strip()
-        if coverage or label:
-            WIDE_FORMAT_ITEMS[code]=(name,PLU_PRICES.get(code,0.0),coverage or "fixed",label or name)
+        if coverage or label: WIDE_FORMAT_ITEMS[code]=(name,PLU_PRICES.get(code,0.0),coverage or "fixed",label or name)
     PAPER_SIZES_MM={}
-    for item in _csv_rows(paths["paper_sizes_file"]):
+    for item in _data_rows(paths["paper_sizes_file"],"Sizes"):
         if str(item.get("active","taip")).strip().lower() not in ("taip","yes","1","true"): continue
         if str(item.get("is_custom","ne")).strip().lower() in ("taip","yes","1","true"): continue
         try: PAPER_SIZES_MM[str(item["name"]).strip()]=(float(str(item["width_mm"]).replace(",",".")),float(str(item["height_mm"]).replace(",",".")))
@@ -2985,7 +3791,7 @@ def reload_editable_data():
 def load_custom_sizes():
     try:
         result={}
-        for item in _csv_rows(_editable_paths()["paper_sizes_file"]):
+        for item in _data_rows(_editable_paths()["paper_sizes_file"],"Sizes"):
             if str(item.get("is_custom","ne")).strip().lower() not in ("taip","yes","1","true"): continue
             result[str(item["name"]).strip()]=(float(str(item["width_mm"]).replace(",",".")),float(str(item["height_mm"]).replace(",",".")))
         return result
@@ -2993,13 +3799,15 @@ def load_custom_sizes():
 
 def save_custom_sizes(sizes_dict):
     path=_editable_paths()["paper_sizes_file"]
-    try: rows=_csv_rows(path)
+    try: rows=_data_rows(path,"Sizes")
     except Exception: rows=[]
     rows=[x for x in rows if str(x.get("is_custom","ne")).strip().lower() not in ("taip","yes","1","true")]
     for name,(w,h) in sizes_dict.items(): rows.append({"group":"Pasirinktiniai","name":name,"width_mm":w,"height_mm":h,"active":"taip","is_custom":"taip","notes_lt":""})
-    fields=["group","name","width_mm","height_mm","active","is_custom","notes_lt"]
-    with open(path,"w",encoding="utf-8-sig",newline="") as f:
-        writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader();writer.writerows(rows)
+    if os.path.splitext(path)[1].lower() in (".xlsx",".xlsm"): _write_sizes_workbook(path,rows)
+    else:
+        fields=["group","name","width_mm","height_mm","active","is_custom","notes_lt"]
+        with open(path,"w",encoding="utf-8-sig",newline="") as f:
+            writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader();writer.writerows(rows)
 
 reload_editable_data()
 
@@ -4172,7 +4980,7 @@ class CopyProApp(dnd.Tk if HAS_DND else tk.Tk):
         lbl(popup,"DUOMENU FAILAI",11,TEXT,True,bg=BG).pack(anchor="w",padx=18,pady=(16,10))
         body=tk.Frame(popup,bg=BG); body.pack(fill="both",expand=True,padx=18)
         def browse(key):
-            p=filedialog.askopenfilename(parent=popup,title="Pasirinkti CSV faila",filetypes=[("CSV","*.csv"),("Visi failai","*.*")])
+            p=filedialog.askopenfilename(parent=popup,title="Pasirinkti Excel failą",filetypes=[("Excel","*.xlsx"),("CSV (senas formatas)","*.csv"),("Visi failai","*.*")])
             if p: vars_[key].set(p)
         for r,(key,title) in enumerate(labels):
             lbl(body,title,9,MUTED,bg=BG).grid(row=r*2,column=0,columnspan=2,sticky="w",pady=(4,2))
@@ -4207,6 +5015,7 @@ class CopyProApp(dnd.Tk if HAS_DND else tk.Tk):
             ("resizer",   "📐  Bulk Resizer",       ResizerTab),
             ("converter", "🔄  File Converter",     ConverterTab),
             ("layout",    "🗂  Print Layout",       PrintLayoutTab),
+            ("cutline",   "✂  Sticker Outline",    StickerCutlineTab),
             ("pdf",       "📄  PDF Optimiser",      PdfToolsTab),
             ("pages",     "📊  Page Counter",       PageCounterTab),
             ("organiser", "🗃  Batch Organiser",    BatchOrganiserTab),

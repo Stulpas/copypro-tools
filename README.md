@@ -57,3 +57,21 @@ Nustatymai, kainos, PLU kodai, popieriaus dydžiai ir naudotojo išsaugoti maket
 Prekių ženklai ir techniniai trumpiniai palikti originalūs, pavyzdžiui:
 `CopyPro`, `Pioneer Navigator`, `Curious Collection`, `INEO`, `USB`, `CD`,
 `DVD`, `PVC`, `SRA3`, `A4`.
+
+
+## Sticker Outline
+
+Skirtukas `Sticker Outline` aptinka ne baltą objekto kraštą ir eksportuoja tikrą
+vektorinę raudoną liniją. Galima keisti balto fono toleranciją, kontūro
+gludinimą, mažiausią objekto plotą, poslinkį milimetrais ir vidinių baltų
+sričių įtraukimą.
+
+Eksportas:
+
+- tik kontūras – vienas PDF arba SVG;
+- vaizdas ir kontūras – vienas PDF arba SVG su atskirais `Artwork` ir
+  `Cut line` sluoksniais / grupėmis.
+
+PDF šaltinio vaizdas PDF eksporte išlieka vektorinis. Įterpiami rastriniai
+vaizdai nemažinami ir papildomai nuostolingai nesuspaudžiami. Kontūro spalva –
+RGB 255, 0, 0.
