@@ -1,6 +1,12 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import os, sys, threading, subprocess, io, math, tempfile, shutil, unicodedata, difflib, json, csv
+from copypro_update_support import (
+    current_version,
+    ensure_installed_in_appdata,
+    check_for_update_async,
+    launch_updater,
+)
 
 # ── Dependency bootstrap ──────────────────────────────────────────────────────
 def _pip(*pkgs):
