@@ -310,15 +310,74 @@ class DropMixin:
         except Exception:
             pass
 
+    def _show_drop_overlay(self, widget):
+        """Show themed drag feedback without recolouring the tab."""
+        try:
+            root = widget.winfo_toplevel()
+            overlay = getattr(root, "_copypro_drop_overlay", None)
+            if overlay is not None and overlay.winfo_exists():
+                return
+
+            overlay = tk.Toplevel(root)
+            overlay.overrideredirect(True)
+            overlay.attributes("-topmost", True)
+            overlay.configure(bg=ACCENT)
+
+            frame = tk.Frame(
+                overlay,
+                bg=SURFACE,
+                highlightbackground=ACCENT,
+                highlightthickness=2,
+                padx=24,
+                pady=16,
+            )
+            frame.pack()
+            tk.Label(
+                frame,
+                text="DROP FILES HERE",
+                bg=SURFACE,
+                fg=TEXT,
+                font=("Segoe UI", 12, "bold"),
+            ).pack()
+            tk.Label(
+                frame,
+                text="Release to add the selected files",
+                bg=SURFACE,
+                fg=MUTED,
+                font=("Segoe UI", 9),
+            ).pack(pady=(4, 0))
+
+            root.update_idletasks()
+            overlay.update_idletasks()
+            x = root.winfo_rootx() + max(
+                0, (root.winfo_width() - overlay.winfo_reqwidth()) // 2
+            )
+            y = root.winfo_rooty() + max(
+                0, (root.winfo_height() - overlay.winfo_reqheight()) // 2
+            )
+            overlay.geometry(f"+{x}+{y}")
+            root._copypro_drop_overlay = overlay
+        except Exception:
+            pass
+
+    def _hide_drop_overlay(self, widget=None):
+        try:
+            root = widget.winfo_toplevel() if widget is not None else self.winfo_toplevel()
+            overlay = getattr(root, "_copypro_drop_overlay", None)
+            if overlay is not None and overlay.winfo_exists():
+                overlay.destroy()
+            root._copypro_drop_overlay = None
+        except Exception:
+            pass
+
     def _drop_enter(self, w):
-        try: w.config(bg=DROP_HL)
-        except: pass
+        self._show_drop_overlay(w)
+
     def _drop_leave(self, w):
-        try: w.config(bg=SURFACE2)
-        except: pass
+        self._hide_drop_overlay(w)
+
     def _on_drop(self, event, widget, callback, extensions):
-        try: widget.config(bg=SURFACE2)
-        except: pass
+        self._hide_drop_overlay(widget)
         paths = parse_dropped_paths(event.data)
         filtered = []
         for p in paths:
