@@ -286,6 +286,30 @@ class DropMixin:
         except Exception:
             pass
 
+    def setup_drop_everywhere(self, root, callback, extensions=None):
+        """Enable file dropping on the full tab, including rebuilt child widgets."""
+        def register_tree(widget):
+            self.setup_drop(widget, callback, extensions)
+            try:
+                for child in widget.winfo_children():
+                    register_tree(child)
+            except Exception:
+                pass
+
+        register_tree(root)
+
+        def refresh():
+            try:
+                register_tree(root)
+                root.after(800, refresh)
+            except Exception:
+                pass
+
+        try:
+            root.after(800, refresh)
+        except Exception:
+            pass
+
     def _drop_enter(self, w):
         try: w.config(bg=DROP_HL)
         except: pass
@@ -760,6 +784,11 @@ class ResizerTab(tk.Frame, DropMixin):
             bg=SURFACE, fg=TEXT, selectcolor=SURFACE2, activebackground=SURFACE,
             font=("Segoe UI",9)).pack(padx=16,anchor="w",pady=(1,0))
 
+        self.stretch_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(left, text="Stretch to fit", variable=self.stretch_var,
+            bg=SURFACE, fg=TEXT, selectcolor=SURFACE2, activebackground=SURFACE,
+            font=("Segoe UI",9)).pack(padx=16,anchor="w",pady=(1,0))
+
         sep(left)
 
         # Output location section
@@ -1131,6 +1160,17 @@ class ResizerTab(tk.Frame, DropMixin):
         self.exp_btn.config(state="disabled")
         threading.Thread(target=self._do_export, args=(dest_resolver,), daemon=True).start()
 
+    def _fit_or_stretch(self, image, size):
+        """Resize while preserving proportions unless Stretch to fit is enabled."""
+        if self.stretch_var.get():
+            return image.resize(size, Image.Resampling.LANCZOS)
+        return ImageOps.fit(
+            image,
+            size,
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        )
+
     def _do_export(self, dest_resolver):
         dpi = self.dpi_var.get()
         tw, th = self._get_target_px()
@@ -1161,7 +1201,10 @@ class ResizerTab(tk.Frame, DropMixin):
                         img = img.rotate(cc.total_rotation, expand=True)
                     iw, ih = img.size
                     fl, ft, fr, fb = cc.get_crop_fractions()
-                    cropped = img.crop((int(fl*iw), int(ft*ih), int(fr*iw), int(fb*ih))).resize((tw, th), Image.LANCZOS)
+                    cropped = self._fit_or_stretch(
+                        img.crop((int(fl*iw), int(ft*ih), int(fr*iw), int(fb*ih))),
+                        (tw, th),
+                    )
                     if self.gray_var.get(): cropped = ImageOps.grayscale(cropped).convert("RGB")
                     cropped = apply_resizer_finishing(cropped, dpi, bleed, bleed_mm, marks, mark_len)
                     pages.append(cropped.convert("RGB"))
@@ -1198,7 +1241,7 @@ class ResizerTab(tk.Frame, DropMixin):
                 iw, ih = img.size
                 fl, ft, fr, fb = cc.get_crop_fractions()
                 box = (int(fl*iw), int(ft*ih), int(fr*iw), int(fb*ih))
-                cropped = img.crop(box).resize((tw,th), Image.LANCZOS)
+                cropped = self._fit_or_stretch(img.crop(box), (tw, th))
                 if self.gray_var.get(): cropped = ImageOps.grayscale(cropped).convert("RGB")
                 cropped = apply_resizer_finishing(cropped, dpi, bleed, bleed_mm, marks, mark_len)
 
@@ -2915,7 +2958,25 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         return raw
     def _item(self,path,cc,dpi,iw,ih,bleed):
         target=(mm_to_px(iw,dpi),mm_to_px(ih,dpi))
-        img=self._processed(path,cc,target_px=target).resize(target,Image.LANCZOS)
+        img=self._processed(path,cc,target_px=target)
+
+        # Automatically rotate the placed artwork when its orientation does not
+        # match the requested item box. This avoids accidental stretching when
+        # width and height were entered in the opposite order.
+        if img.width and img.height and target[0] and target[1]:
+            image_landscape = img.width > img.height
+            target_landscape = target[0] > target[1]
+            if image_landscape != target_landscape:
+                img = img.rotate(90, expand=True)
+
+        # Preserve image proportions. Crop centrally to the target aspect ratio
+        # instead of distorting the artwork.
+        img=ImageOps.fit(
+            img,
+            target,
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5,0.5),
+        )
         return add_bleed_and_marks(img,bleed,dpi,False) if bleed>0 else img
     def _sheet(self,assignments,back=False,dpi_override=None,preview_guides=False):
         pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,gw,gh=self._metrics(); dpi=int(dpi_override or self.dpi_var.get()); sheet=Image.new("RGB",(mm_to_px(pw,dpi),mm_to_px(ph,dpi)),"white"); by={p:c for p,c in self.canvases}
@@ -5247,6 +5308,21 @@ class CopyProApp(dnd.Tk if HAS_DND else tk.Tk):
         self.tabs = {}; self.tab_btns = {}
         for key,_,cls in tab_defs:
             self.tabs[key] = cls(content)
+
+        # Make the complete visible area of every file-based tab a drop target.
+        drop_rules = {
+            "resizer": IMAGE_EXTS | {".pdf"},
+            "converter": None,
+            "layout": IMAGE_EXTS | {".pdf"},
+            "cutline": IMAGE_EXTS | {".pdf"},
+            "pdf": {".pdf"},
+            "pages": {".pdf"},
+            "organiser": {".pdf"},
+        }
+        for key, extensions in drop_rules.items():
+            tab = self.tabs.get(key)
+            if tab is not None and hasattr(tab, "setup_drop_everywhere") and hasattr(tab, "_drop_files"):
+                tab.setup_drop_everywhere(tab, tab._drop_files, extensions)
 
         def switch(k):
             for kk,t in self.tabs.items():
