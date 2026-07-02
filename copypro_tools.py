@@ -2416,9 +2416,22 @@ class PrintCropCanvas(CropCanvas):
 class PrintLayoutTab(tk.Frame,DropMixin):
     def __init__(self,parent):
         super().__init__(parent,bg=BG)
-        self.files=[]; self.canvases=[]; self.layouts=load_print_layouts(); self.custom_sizes=load_custom_sizes(); self._preview_job=None
-        self.pdf_sources={}; self.display_names={}; self._temp_dir=tempfile.mkdtemp(prefix="copypro_print_")
-        self._build(); self._load_layout("Default")
+
+        # Initialise preview state before building widgets or loading a preset.
+        self.files=[]
+        self.canvases=[]
+        self.layouts=load_print_layouts()
+        self.custom_sizes=load_custom_sizes()
+        self._preview_job=None
+        self._preview_item_cache={}
+        self._preview_cache_limit=64
+        self.preview_images=[]
+        self.pdf_sources={}
+        self.display_names={}
+        self._temp_dir=tempfile.mkdtemp(prefix="copypro_print_")
+
+        self._build()
+        self._load_layout("Default")
     def on_show(self):
         self.custom_sizes=load_custom_sizes(); self.paper_cb.config(values=self._paper_names())
     def _paper_names(self): return list(PAPER_SIZES_MM)+list(self.custom_sizes)
@@ -2725,6 +2738,8 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         width=max(.1,float(width)); height=max(.1,float(height))
         self.item_w.set(width); self.item_h.set(height)
         self.item_w_input.set(f"{width:g}"); self.item_h_input.set(f"{height:g}")
+        if not hasattr(self,"_preview_item_cache"):
+            self._preview_item_cache={}
         self._preview_item_cache.clear()
         if refresh:self._rebuild()
 
