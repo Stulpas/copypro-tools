@@ -1,5 +1,5 @@
 import tkinter as tk, time
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
 import os, sys, threading, subprocess, io, math, tempfile, shutil, unicodedata, difflib, json, csv, zipfile, webbrowser, base64, mimetypes, html
 from pathlib import Path
 from copypro_update_support import (
@@ -645,74 +645,44 @@ class CropCanvas(tk.Canvas):
         return (l/iw, t/ih, r/iw, b/ih)
 
 # ── Bleed helper ─────────────────────────────────────────────────────────────
-def add_bleed_and_marks(img, bleed_mm, dpi, crop_marks=True, mark_len_mm=5, mark_gap_mm=1):
-    """
-    Extend image with mirror-bleed on all sides, optionally add crop marks.
-    Returns new PIL Image.
-    """
-    bp   = mm_to_px(bleed_mm, dpi)
-    iw, ih = img.size
-    new_w = iw + bp*2
-    new_h = ih + bp*2
-
-    # Create canvas (white if crop marks, else transparent-safe)
-    extra = mm_to_px(mark_len_mm + mark_gap_mm + 2, dpi) if crop_marks else 0
-    canvas_w = new_w + extra*2
-    canvas_h = new_h + extra*2
-    canvas = Image.new("RGB", (canvas_w, canvas_h), (255,255,255))
-
-    # Mirror bleed strips
-    left_strip  = img.crop((0, 0, bp, ih)).transpose(Image.FLIP_LEFT_RIGHT)
-    right_strip = img.crop((iw-bp, 0, iw, ih)).transpose(Image.FLIP_LEFT_RIGHT)
-    top_strip   = img.crop((0, 0, iw, bp)).transpose(Image.FLIP_TOP_BOTTOM)
-    bot_strip   = img.crop((0, ih-bp, iw, ih)).transpose(Image.FLIP_TOP_BOTTOM)
-
-    # Corners (mirror of corner squares)
-    tl = img.crop((0,0,bp,bp)).transpose(Image.ROTATE_180)
-    tr = img.crop((iw-bp,0,iw,bp)).transpose(Image.ROTATE_180)
-    bl = img.crop((0,ih-bp,bp,ih)).transpose(Image.ROTATE_180)
-    br = img.crop((iw-bp,ih-bp,iw,ih)).transpose(Image.ROTATE_180)
-
-    ox = extra + bp  # origin x of the original image on canvas
-    oy = extra + bp
-
-    canvas.paste(img,          (ox, oy))
-    canvas.paste(left_strip,   (ox-bp, oy))
-    canvas.paste(right_strip,  (ox+iw, oy))
-    canvas.paste(top_strip,    (ox, oy-bp))
-    canvas.paste(bot_strip,    (ox, oy+ih))
-    canvas.paste(tl,           (ox-bp, oy-bp))
-    canvas.paste(tr,           (ox+iw, oy-bp))
-    canvas.paste(bl,           (ox-bp, oy+ih))
-    canvas.paste(br,           (ox+iw, oy+ih))
-
+def add_bleed_and_marks(img,bleed_mm,dpi,crop_marks=True,mark_len_mm=5,
+                        mark_gap_mm=2,bleed_mode="reflected",
+                        bleed_color=(255,255,255)):
+    """Add reflected or solid-colour bleed and optional crop marks."""
+    bp=max(0,mm_to_px(bleed_mm,dpi)); iw,ih=img.size
+    extra=mm_to_px(mark_len_mm+mark_gap_mm+2,dpi) if crop_marks else 0
+    canvas=Image.new("RGB",(iw+bp*2+extra*2,ih+bp*2+extra*2),"white")
+    ox,oy=extra+bp,extra+bp; source=img.convert("RGB")
+    if bleed_mode=="solid":
+        canvas.paste(Image.new("RGB",(iw+bp*2,ih+bp*2),tuple(bleed_color)),(extra,extra))
+        canvas.paste(source,(ox,oy))
+    else:
+        canvas.paste(source,(ox,oy))
+        if bp:
+            left=source.crop((0,0,min(bp,iw),ih)).resize((bp,ih)).transpose(Image.FLIP_LEFT_RIGHT)
+            right=source.crop((max(0,iw-bp),0,iw,ih)).resize((bp,ih)).transpose(Image.FLIP_LEFT_RIGHT)
+            top=source.crop((0,0,iw,min(bp,ih))).resize((iw,bp)).transpose(Image.FLIP_TOP_BOTTOM)
+            bottom=source.crop((0,max(0,ih-bp),iw,ih)).resize((iw,bp)).transpose(Image.FLIP_TOP_BOTTOM)
+            canvas.paste(left,(ox-bp,oy)); canvas.paste(right,(ox+iw,oy))
+            canvas.paste(top,(ox,oy-bp)); canvas.paste(bottom,(ox,oy+ih))
+            corners=[
+                ((0,0,min(bp,iw),min(bp,ih)),(ox-bp,oy-bp)),
+                ((max(0,iw-bp),0,iw,min(bp,ih)),(ox+iw,oy-bp)),
+                ((0,max(0,ih-bp),min(bp,iw),ih),(ox-bp,oy+ih)),
+                ((max(0,iw-bp),max(0,ih-bp),iw,ih),(ox+iw,oy+ih)),
+            ]
+            for box,pos in corners:
+                canvas.paste(source.crop(box).resize((bp,bp)).transpose(Image.ROTATE_180),pos)
     if crop_marks:
-        draw = ImageDraw.Draw(canvas)
-        gap = mm_to_px(mark_gap_mm, dpi)
-        mlen = mm_to_px(mark_len_mm, dpi)
-        lw = max(1, mm_to_px(0.25, dpi))
-        col = (0,0,0)
-
-        # Corner positions on the full canvas: corners of the bleed box
-        corners = [
-            (ox-bp, oy-bp),  # TL
-            (ox+iw+bp, oy-bp),  # TR
-            (ox-bp, oy+ih+bp),  # BL
-            (ox+iw+bp, oy+ih+bp),  # BR
-        ]
-        dirs = [(-1,-1), (1,-1), (-1,1), (1,1)]  # outward direction per corner
-
-        for (cx,cy),(dx,dy) in zip(corners, dirs):
-            # horizontal mark
-            x0 = cx + dx*gap; x1 = cx + dx*(gap+mlen)
-            draw.line([(x0,cy),(x1,cy)], fill=col, width=lw)
-            # vertical mark
-            y0 = cy + dy*gap; y1 = cy + dy*(gap+mlen)
-            draw.line([(cx,y0),(cx,y1)], fill=col, width=lw)
-
+        draw=ImageDraw.Draw(canvas); gap=mm_to_px(mark_gap_mm,dpi)
+        mlen=mm_to_px(mark_len_mm,dpi); lw=max(1,mm_to_px(.25,dpi))
+        for cx,cy,dx,dy in ((ox-bp,oy-bp,-1,-1),(ox+iw+bp,oy-bp,1,-1),
+                            (ox-bp,oy+ih+bp,-1,1),(ox+iw+bp,oy+ih+bp,1,1)):
+            draw.line((cx+dx*gap,cy,cx+dx*(gap+mlen),cy),fill="black",width=lw)
+            draw.line((cx,cy+dy*gap,cx,cy+dy*(gap+mlen)),fill="black",width=lw)
     return canvas
 
-def add_crop_marks_only(img, dpi, mark_len_mm=5, mark_gap_mm=1):
+def add_crop_marks_only(img, dpi, mark_len_mm=5, mark_gap_mm=2):
     """Add crop marks around an image without adding bleed."""
     gap = mm_to_px(mark_gap_mm, dpi)
     mlen = mm_to_px(mark_len_mm, dpi)
@@ -729,11 +699,12 @@ def add_crop_marks_only(img, dpi, mark_len_mm=5, mark_gap_mm=1):
             draw.line((x,y+dy*gap,x,y+dy*(gap+mlen)),fill="black",width=lw)
     return canvas
 
-def apply_resizer_finishing(img, dpi, add_bleed, bleed_mm, crop_marks, mark_len_mm):
-    if add_bleed and bleed_mm > 0:
-        return add_bleed_and_marks(img, bleed_mm, dpi, crop_marks, mark_len_mm)
-    if crop_marks:
-        return add_crop_marks_only(img, dpi, mark_len_mm)
+def apply_resizer_finishing(img,dpi,add_bleed,bleed_mm,crop_marks,
+                              bleed_mode="reflected",bleed_color=(255,255,255)):
+    if add_bleed and bleed_mm>0:
+        return add_bleed_and_marks(img,bleed_mm,dpi,crop_marks,5,2,
+                                   bleed_mode,bleed_color)
+    if crop_marks:return add_crop_marks_only(img,dpi,5,2)
     return img
 
 # ── Resizer Tab ───────────────────────────────────────────────────────────────
@@ -822,21 +793,27 @@ class ResizerTab(tk.Frame, DropMixin):
             bg=SURFACE, fg=TEXT, selectcolor=SURFACE2, activebackground=SURFACE,
             font=("Segoe UI",9), command=self._toggle_bleed).pack(side="left")
 
-        # Bleed amount is shown only when bleed is enabled.
-        self.bleed_opts = tk.Frame(left, bg=SURFACE)
-        br = tk.Frame(self.bleed_opts, bg=SURFACE); br.pack(fill="x",padx=4,pady=1)
+        # Bleed amount and mode are shown only when bleed is enabled.
+        self.bleed_opts=tk.Frame(left,bg=SURFACE)
+        br=tk.Frame(self.bleed_opts,bg=SURFACE); br.pack(fill="x",padx=4,pady=1)
         lbl(br,"Bleed (mm)",8).pack(side="left",padx=(0,4))
-        self.bleed_mm = entry(br, w=5); self.bleed_mm.insert(0,"3"); self.bleed_mm.pack(side="left")
+        self.bleed_mm=entry(br,w=5); self.bleed_mm.insert(0,"3"); self.bleed_mm.pack(side="left")
+        self.bleed_mode_var=tk.StringVar(value="reflected")
+        mode=tk.Frame(self.bleed_opts,bg=SURFACE); mode.pack(fill="x",padx=4,pady=(2,1))
+        for caption,value in (("Reflected","reflected"),("Solid colour","solid")):
+            tk.Radiobutton(mode,text=caption,variable=self.bleed_mode_var,value=value,
+                bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,
+                font=("Segoe UI",8),command=self._toggle_bleed_colour).pack(side="left",padx=(0,6))
+        self.bleed_color=(255,255,255)
+        self.bleed_color_btn=tk.Button(self.bleed_opts,text="Choose bleed colour",
+            command=self._choose_bleed_colour,bg="#FFFFFF",fg="#111111",
+            relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2",padx=7,pady=3)
 
-        marks_row = tk.Frame(left, bg=SURFACE)
-        marks_row.pack(fill="x", padx=16, pady=(1,2))
-        self.marks_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(marks_row, text="Add crop marks", variable=self.marks_var,
-            bg=SURFACE, fg=TEXT, selectcolor=SURFACE2, activebackground=SURFACE,
+        marks_row=tk.Frame(left,bg=SURFACE); marks_row.pack(fill="x",padx=16,pady=(1,2))
+        self.marks_var=tk.BooleanVar(value=False)
+        tk.Checkbutton(marks_row,text="Add crop marks",variable=self.marks_var,
+            bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,
             font=("Segoe UI",9)).pack(side="left")
-        lbl(marks_row,"Length",8,MUTED).pack(side="left",padx=(8,3))
-        self.mark_len = entry(marks_row, w=4); self.mark_len.insert(0,"5"); self.mark_len.pack(side="left")
-        lbl(marks_row,"mm",8,MUTED).pack(side="left",padx=(3,0))
 
         self.gray_var = tk.BooleanVar(value=False)
         tk.Checkbutton(left, text="Grayscale", variable=self.gray_var,
@@ -947,11 +924,24 @@ class ResizerTab(tk.Frame, DropMixin):
         else:
             self.q_lbl.pack_forget(); self.q_slider.pack_forget()
 
+    def _choose_bleed_colour(self):
+        result=colorchooser.askcolor(color="#%02X%02X%02X"%self.bleed_color,
+                                     title="Choose bleed colour",parent=self)
+        if result and result[0]:
+            self.bleed_color=tuple(int(round(v)) for v in result[0])
+            self.bleed_color_btn.config(bg=result[1],
+                fg="#111111" if sum(self.bleed_color)/3>150 else "#FFFFFF")
+
+    def _toggle_bleed_colour(self):
+        if self.bleed_mode_var.get()=="solid":
+            self.bleed_color_btn.pack(anchor="w",padx=4,pady=(2,2))
+        else:self.bleed_color_btn.pack_forget()
+
     def _toggle_bleed(self):
         if self.bleed_var.get():
-            self.bleed_opts.pack(fill="x", padx=16, pady=(0,6), after=self.bleed_row)
-        else:
-            self.bleed_opts.pack_forget()
+            self.bleed_opts.pack(fill="x",padx=16,pady=(0,6),after=self.bleed_row)
+            self._toggle_bleed_colour()
+        else:self.bleed_opts.pack_forget()
 
     def _on_size(self, e=None):
         sel = self.size_var.get()
@@ -1239,9 +1229,8 @@ class ResizerTab(tk.Frame, DropMixin):
         bleed = self.bleed_var.get()
         try: bleed_mm = float(self.bleed_mm.get())
         except: bleed_mm = 3.0
-        marks = self.marks_var.get()
-        try: mark_len = float(self.mark_len.get())
-        except: mark_len = 5.0
+        marks=self.marks_var.get()
+        bleed_mode=self.bleed_mode_var.get(); bleed_color=self.bleed_color
         replace_originals = (self.dest_var.get() == "same" and self.overwrite_var.get())
         done = errors = 0
         last_out_dir = ""
@@ -1265,7 +1254,7 @@ class ResizerTab(tk.Frame, DropMixin):
                         (tw, th),
                     )
                     if self.gray_var.get(): cropped = ImageOps.grayscale(cropped).convert("RGB")
-                    cropped = apply_resizer_finishing(cropped, dpi, bleed, bleed_mm, marks, mark_len)
+                    cropped = apply_resizer_finishing(cropped,dpi,bleed,bleed_mm,marks,bleed_mode,bleed_color)
                     pages.append(cropped.convert("RGB"))
                     done += 1
                 except Exception:
@@ -1302,7 +1291,7 @@ class ResizerTab(tk.Frame, DropMixin):
                 box = (int(fl*iw), int(ft*ih), int(fr*iw), int(fb*ih))
                 cropped = self._fit_or_stretch(img.crop(box), (tw, th))
                 if self.gray_var.get(): cropped = ImageOps.grayscale(cropped).convert("RGB")
-                cropped = apply_resizer_finishing(cropped, dpi, bleed, bleed_mm, marks, mark_len)
+                cropped = apply_resizer_finishing(cropped,dpi,bleed,bleed_mm,marks,bleed_mode,bleed_color)
 
                 out_dir = dest_resolver(path)
                 last_out_dir = out_dir
@@ -2473,11 +2462,16 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         tk.Button(grid_hdr,text="Auto…",command=self._open_layout_calculator,bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2",padx=6,pady=1).pack(side="right")
         size_row=tk.Frame(left,bg=SURFACE); size_row.pack(fill="x",padx=12,pady=(2,0))
         self.item_w=tk.DoubleVar(value=90); self.item_h=tk.DoubleVar(value=50)
+        self.item_w_input=tk.StringVar(value="90"); self.item_h_input=tk.StringVar(value="50")
         self.cols_var=tk.IntVar(value=2); self.rows_var=tk.IntVar(value=5)
-        for i,(t,v) in enumerate((("Width",self.item_w),("Height",self.item_h))):
+        for i,(caption,var) in enumerate((("Width",self.item_w_input),("Height",self.item_h_input))):
             f=tk.Frame(size_row,bg=SURFACE); f.pack(side="left",fill="x",expand=True,padx=(0 if i==0 else 4,0))
-            lbl(f,t+" (mm)",7,MUTED).pack(anchor="w"); e=entry(f,v,7); e.pack(fill="x"); e.bind("<KeyRelease>",self._changed)
-        tk.Button(size_row,text="Presets",command=self._open_item_size_presets,bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",7,"bold"),cursor="hand2",padx=5,pady=3).pack(side="left",padx=(5,0),pady=(11,0))
+            lbl(f,caption+" (mm)",7,MUTED).pack(anchor="w"); e=entry(f,var,7); e.pack(fill="x")
+            e.bind("<Return>",self._apply_item_size); e.bind("<KP_Enter>",self._apply_item_size)
+        tk.Button(size_row,text="Update",command=self._apply_item_size,bg=ACCENT,fg="white",
+            relief="flat",font=("Segoe UI",7,"bold"),cursor="hand2",padx=6,pady=3).pack(side="left",padx=(5,0),pady=(11,0))
+        tk.Button(size_row,text="Presets",command=self._open_item_size_presets,bg=SURFACE2,fg=TEXT,
+            relief="flat",font=("Segoe UI",7,"bold"),cursor="hand2",padx=5,pady=3).pack(side="left",padx=(4,0),pady=(11,0))
 
         def grid_spin(parent,label,var):
             f=tk.Frame(parent,bg=SURFACE)
@@ -2727,6 +2721,20 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         pw,ph=self._paper_mm(); iw=max(.1,self._num(self.item_w,90)); ih=max(.1,self._num(self.item_h,50)); cols=max(1,int(self._num(self.cols_var,1))); rows=max(1,int(self._num(self.rows_var,1))); gap=max(0,self._num(self.spacing_var,0)); bleed=max(0,self._num(self.bleed_mm,0)) if self.bleed_var.get() else 0
         gw=cols*iw+(cols-1)*gap+2*bleed; gh=rows*ih+(rows-1)*gap+2*bleed; x0=(pw-gw)/2+bleed; y0=(ph-gh)/2+bleed
         return pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,gw,gh
+    def _set_item_size(self,width,height,refresh=True):
+        width=max(.1,float(width)); height=max(.1,float(height))
+        self.item_w.set(width); self.item_h.set(height)
+        self.item_w_input.set(f"{width:g}"); self.item_h_input.set(f"{height:g}")
+        self._preview_item_cache.clear()
+        if refresh:self._rebuild()
+
+    def _apply_item_size(self,event=None):
+        try:self._set_item_size(float(self.item_w_input.get().replace(",",".")),
+                                float(self.item_h_input.get().replace(",",".")),True)
+        except Exception:messagebox.showwarning("Invalid item size",
+            "Enter valid positive width and height values.",parent=self)
+        return "break" if event is not None else None
+
     def _changed(self,event=None): self._schedule_preview()
     def _mode_changed(self):
         mode=self.mode_var.get()
@@ -2748,7 +2756,7 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         sb=ttk.Scrollbar(holder,orient="vertical",command=canvas.yview); sb.pack(side="right",fill="y"); canvas.configure(yscrollcommand=sb.set)
         inner=tk.Frame(canvas,bg=SURFACE); win=canvas.create_window((0,0),window=inner,anchor="nw")
         inner.bind("<Configure>",lambda e:canvas.configure(scrollregion=canvas.bbox("all"))); canvas.bind("<Configure>",lambda e:canvas.itemconfig(win,width=e.width))
-        def apply_size(name,w,h): self.item_w.set(w); self.item_h.set(h); self._rebuild(); popup.destroy()
+        def apply_size(name,w,h): self._set_item_size(w,h,True); popup.destroy()
         def add_row(parent,name,w,h,delete=False):
             row=tk.Frame(parent,bg=SURFACE2); row.pack(fill="x",padx=8,pady=2)
             tk.Button(row,text=f"{name}   {w:g} × {h:g} mm",command=lambda:apply_size(name,w,h),anchor="w",bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",9),cursor="hand2").pack(side="left",fill="x",expand=True)
@@ -2803,20 +2811,21 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         def apply_result():
             calculate()
             if state.get("cols",0)<1:return
-            self.item_w.set(state["w"]); self.item_h.set(state["h"]); self.cols_var.set(state["cols"]); self.rows_var.set(state["rows"])
+            self._set_item_size(state["w"],state["h"],False); self.cols_var.set(state["cols"]); self.rows_var.set(state["rows"])
             self.bleed_mm.set(state["bleed"]); self.bleed_var.set(state["bleed"]>0); self.spacing_var.set(state["gap"]); self._toggle_bleed(); self._rebuild(); popup.destroy()
         actions=tk.Frame(popup,bg=BG); actions.pack(pady=4)
         styled_btn(actions,"Calculate",calculate).pack(side="left",padx=4); styled_btn(actions,"Apply layout",apply_result,style="success").pack(side="left",padx=4); styled_btn(actions,"Cancel",popup.destroy,style="secondary").pack(side="left",padx=4)
         calculate()
     def _brightness_changed(self,v): self.brightness_lbl.config(text=f"Brightness: {int(float(v))}%"); self._effects_changed()
     def _effects_changed(self):
+        self._preview_item_cache.clear()
         for _,c in self.canvases:c.set_effects(self.gray_var.get(),self.brightness_var.get())
         self._schedule_preview()
     def _schedule_preview(self):
         if self._preview_job:
             try:self.after_cancel(self._preview_job)
             except:pass
-        self._preview_job=self.after(80,self._draw_preview)
+        self._preview_job=self.after(180,self._draw_preview)
     def _draw_preview(self):
         self._preview_job=None
         for child in self.preview_frame.winfo_children(): child.destroy()
@@ -2848,10 +2857,10 @@ class PrintLayoutTab(tk.Frame,DropMixin):
             try:
                 # Rendering at 55 DPI is enough for a clear on-screen preview and
                 # stays responsive even when many imposed pages are shown.
-                sheet=self._sheet(assignments,back=back,dpi_override=70,preview_guides=True)
+                sheet=self._sheet(assignments,back=back,dpi_override=42,preview_guides=True)
                 max_h=420
                 scale=min(card_w/sheet.width,max_h/sheet.height,1.0)
-                shown=sheet.resize((max(1,int(sheet.width*scale)),max(1,int(sheet.height*scale))),Image.LANCZOS)
+                shown=sheet.resize((max(1,int(sheet.width*scale)),max(1,int(sheet.height*scale))),Image.Resampling.BILINEAR)
                 photo=ImageTk.PhotoImage(shown)
                 self.preview_images.append(photo)
                 tk.Label(card,image=photo,bg=SURFACE2,bd=0,highlightbackground=BORDER,highlightthickness=1).pack()
@@ -2877,7 +2886,7 @@ class PrintLayoutTab(tk.Frame,DropMixin):
                     for page_no in range(len(doc)):
                         key=f"{p}::page::{page_no}"
                         if any(self.pdf_sources.get(existing)==(p,page_no) for existing in self.files): continue
-                        page=doc[page_no]; pix=page.get_pixmap(matrix=fitz.Matrix(100/72,100/72),alpha=False)
+                        page=doc[page_no]; pix=page.get_pixmap(matrix=fitz.Matrix(60/72,60/72),alpha=False)
                         img=Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
                         preview=os.path.join(self._temp_dir,f"pdf_{abs(hash(key))}_{page_no+1}.png"); img.save(preview,"PNG")
                         self.files.append(preview); self.pdf_sources[preview]=(p,page_no); self.display_names[preview]=f"{os.path.basename(p)} — page {page_no+1}"; changed=True
@@ -2887,7 +2896,7 @@ class PrintLayoutTab(tk.Frame,DropMixin):
                 self.files.append(p); self.display_names[p]=os.path.basename(p); changed=True
         if changed:self._rebuild()
     def _clear(self):
-        self.files.clear(); self.canvases.clear(); self.pdf_sources.clear(); self.display_names.clear(); self._show_empty()
+        self._preview_item_cache.clear(); self.files.clear(); self.canvases.clear(); self.pdf_sources.clear(); self.display_names.clear(); self._show_empty()
     def _remove(self,path):
         if path in self.files:self.files.remove(path)
         self.pdf_sources.pop(path,None); self.display_names.pop(path,None); self._rebuild()
@@ -2898,10 +2907,11 @@ class PrintLayoutTab(tk.Frame,DropMixin):
             self.files[i],self.files[j]=self.files[j],self.files[i]
             self._rebuild()
     def _rebuild(self):
+        self._preview_item_cache.clear()
         for w in self.cards_frame.winfo_children():w.destroy()
         self.canvases.clear()
         if not self.files:self._show_empty();return
-        dpi=int(self.dpi_var.get()); tw=mm_to_px(max(.1,self._num(self.item_w,90)),dpi); th=mm_to_px(max(.1,self._num(self.item_h,50)),dpi)
+        preview_dpi=72; tw=mm_to_px(max(.1,self._num(self.item_w,90)),preview_dpi); th=mm_to_px(max(.1,self._num(self.item_h,50)),preview_dpi)
         for i,path in enumerate(self.files):
             cell=tk.Frame(
                 self.cards_frame,
@@ -2981,12 +2991,12 @@ class PrintLayoutTab(tk.Frame,DropMixin):
     def _load_layout(self,name):
         d=self.layouts.get(name)
         if not d:return
-        self.layout_var.set(name); self.paper_var.set(d.get("paper","A4")); self.orientation_var.set(d.get("orientation","Portrait")); self.item_w.set(d.get("item_w",90)); self.item_h.set(d.get("item_h",50)); self.cols_var.set(d.get("cols",2)); self.rows_var.set(d.get("rows",5)); self.mode_var.set(d.get("mode","Repeat")); self.duplex_var.set(d.get("duplex",False)); self.bleed_var.set(d.get("bleed",False)); self.bleed_mm.set(d.get("bleed_mm",3)); self.spacing_var.set(d.get("spacing",0)); self.gray_var.set(d.get("grayscale",False)); self.brightness_var.set(d.get("brightness",100)); self.dpi_var.set(d.get("dpi",300)); self.cut_marks_var.set(d.get("cut_marks",False)); self.cut_labels_var.set(d.get("cut_labels",False)); self._toggle_cut_marks(); self.brightness_lbl.config(text=f"Brightness: {self.brightness_var.get()}%"); self._toggle_bleed(); self._mode_changed()
+        self.layout_var.set(name); self.paper_var.set(d.get("paper","A4")); self.orientation_var.set(d.get("orientation","Portrait")); self._set_item_size(d.get("item_w",90),d.get("item_h",50),False); self.cols_var.set(d.get("cols",2)); self.rows_var.set(d.get("rows",5)); self.mode_var.set(d.get("mode","Repeat")); self.duplex_var.set(d.get("duplex",False)); self.bleed_var.set(d.get("bleed",False)); self.bleed_mm.set(d.get("bleed_mm",3)); self.spacing_var.set(d.get("spacing",0)); self.gray_var.set(d.get("grayscale",False)); self.brightness_var.set(d.get("brightness",100)); self.dpi_var.set(d.get("dpi",300)); self.cut_marks_var.set(d.get("cut_marks",False)); self.cut_labels_var.set(d.get("cut_labels",False)); self._toggle_cut_marks(); self.brightness_lbl.config(text=f"Brightness: {self.brightness_var.get()}%"); self._toggle_bleed(); self._mode_changed()
     def _save_layout_dialog(self):
         name=simpledialog.askstring("Save layout","Layout name:",initialvalue=self.layout_var.get(),parent=self)
         if not name:return
         name=name.strip(); self.layouts[name]=self._current_layout(); save_print_layouts(self.layouts); self.layout_cb.config(values=list(self.layouts)); self.layout_var.set(name); self.status.config(text=f"Saved layout: {name}",fg=SUCCESS)
-    def _processed(self,path,cc,target_px=None):
+    def _processed(self,path,cc,target_px=None,preview=False):
         if path in self.pdf_sources:
             # PDFs are resolution-independent when they contain vector artwork. Render
             # each page specifically for its final placed size, with 2x supersampling,
@@ -3000,50 +3010,52 @@ class PrintLayoutTab(tk.Frame,DropMixin):
             if cc.total_rotation in (90,270):
                 page_w,page_h=page_h,page_w
             if target_px:
-                target_w,target_h=target_px
-                scale=max((target_w*2)/(page_w*frac_w),(target_h*2)/(page_h*frac_h))
-                render_dpi=max(int(self.dpi_var.get()),min(1200,int(math.ceil(scale*72))))
-            else:
-                render_dpi=max(600,int(self.dpi_var.get())*2)
+                target_w,target_h=target_px; multiplier=1.15 if preview else 2
+                scale=max((target_w*multiplier)/(page_w*frac_w),
+                          (target_h*multiplier)/(page_h*frac_h))
+                render_dpi=(max(45,min(100,int(math.ceil(scale*72)))) if preview else
+                            max(int(self.dpi_var.get()),min(1200,int(math.ceil(scale*72)))))
+            else:render_dpi=90 if preview else max(600,int(self.dpi_var.get())*2)
             pix=page.get_pixmap(matrix=fitz.Matrix(render_dpi/72,render_dpi/72),alpha=False)
             raw=Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
             doc.close()
         else:
-            raw=ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+            source=ImageOps.exif_transpose(Image.open(path))
+            if preview:
+                limit=max(600,min(1400,max(target_px or (900,900))*2))
+                source.thumbnail((limit,limit),Image.Resampling.BILINEAR)
+            raw=source.convert("RGB")
         if cc.total_rotation:raw=raw.rotate(cc.total_rotation,expand=True)
         iw,ih=raw.size; l,t,r,b=cc.get_crop_fractions(); raw=raw.crop((int(l*iw),int(t*ih),int(r*iw),int(b*ih)))
         if self.gray_var.get():raw=ImageOps.grayscale(raw).convert("RGB")
         if self.brightness_var.get()!=100:raw=ImageEnhance.Brightness(raw).enhance(self.brightness_var.get()/100)
         return raw
-    def _item(self,path,cc,dpi,iw,ih,bleed):
-        target=(mm_to_px(iw,dpi),mm_to_px(ih,dpi))
-        img=self._processed(path,cc,target_px=target)
+    def _item(self,path,cc,dpi,iw,ih,bleed,preview=False):
+        target=(mm_to_px(iw,dpi),mm_to_px(ih,dpi)); key=None
+        if preview:
+            key=(path,tuple(round(v,4) for v in cc.get_crop_fractions()),
+                 int(cc.total_rotation),target,round(float(bleed),2),
+                 bool(self.gray_var.get()),int(self.brightness_var.get()))
+            if key in self._preview_item_cache:return self._preview_item_cache[key]
+        img=self._processed(path,cc,target,preview)
+        if img.width and img.height and (img.width>img.height)!=(target[0]>target[1]):
+            img=img.rotate(90,expand=True)
+        img=ImageOps.fit(img,target,method=(Image.Resampling.BILINEAR if preview else
+                         Image.Resampling.LANCZOS),centering=(.5,.5))
+        if bleed>0:img=add_bleed_and_marks(img,bleed,dpi,False)
+        if preview:
+            if len(self._preview_item_cache)>=self._preview_cache_limit:
+                self._preview_item_cache.pop(next(iter(self._preview_item_cache)),None)
+            self._preview_item_cache[key]=img
+        return img
 
-        # Automatically rotate the placed artwork when its orientation does not
-        # match the requested item box. This avoids accidental stretching when
-        # width and height were entered in the opposite order.
-        if img.width and img.height and target[0] and target[1]:
-            image_landscape = img.width > img.height
-            target_landscape = target[0] > target[1]
-            if image_landscape != target_landscape:
-                img = img.rotate(90, expand=True)
-
-        # Preserve image proportions. Crop centrally to the target aspect ratio
-        # instead of distorting the artwork.
-        img=ImageOps.fit(
-            img,
-            target,
-            method=Image.Resampling.LANCZOS,
-            centering=(0.5,0.5),
-        )
-        return add_bleed_and_marks(img,bleed,dpi,False) if bleed>0 else img
     def _sheet(self,assignments,back=False,dpi_override=None,preview_guides=False):
         pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,gw,gh=self._metrics(); dpi=int(dpi_override or self.dpi_var.get()); sheet=Image.new("RGB",(mm_to_px(pw,dpi),mm_to_px(ph,dpi)),"white"); by={p:c for p,c in self.canvases}
         for slot,path in enumerate(assignments):
             if not path or path not in by:continue
             row=slot//cols; col=slot%cols
             if back:col=cols-1-col
-            item=self._item(path,by[path],dpi,iw,ih,bleed); tx=x0+col*(iw+gap)-bleed; ty=y0+row*(ih+gap)-bleed; sheet.paste(item,(mm_to_px(tx,dpi),mm_to_px(ty,dpi)))
+            item=self._item(path,by[path],dpi,iw,ih,bleed,preview=(dpi_override is not None)); tx=x0+col*(iw+gap)-bleed; ty=y0+row*(ih+gap)-bleed; sheet.paste(item,(mm_to_px(tx,dpi),mm_to_px(ty,dpi)))
         if self.cut_marks_var.get(): self._draw_cut_guides(sheet,pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,dpi)
         if preview_guides:
             draw=ImageDraw.Draw(sheet)
@@ -3579,6 +3591,7 @@ PLU_PRICES["9316"] = 2.00
 
 # Wide-format colour printing and materials.
 # Prices and descriptions are taken from the current in-store wide-format list.
+WIDE_FORMAT_ORDER = []
 WIDE_FORMAT_ITEMS = {
     "4800": ("80 gsm paprastas / brėžinys", 0.95, "drawing"),
     "4810": ("80 gsm paprastas / tekstas+pav.", 1.40, "partial"),
@@ -4103,9 +4116,9 @@ def _ensure_editable_files():
     _copy_default_if_missing(paths["paper_sizes_file"],"copypro_popieriaus_dydziai.xlsx")
 
 def reload_editable_data():
-    global PAPER_SIZES_MM, WIDE_FORMAT_ITEMS, PLU_SEARCH_ALIASES
+    global PAPER_SIZES_MM, WIDE_FORMAT_ITEMS, WIDE_FORMAT_ORDER, PLU_SEARCH_ALIASES
     _ensure_editable_files(); paths=_editable_paths()
-    PLU_DESCRIPTIONS.clear(); PLU_PRICES.clear(); WIDE_FORMAT_ITEMS={}; PLU_SEARCH_ALIASES={}
+    PLU_DESCRIPTIONS.clear(); PLU_PRICES.clear(); WIDE_FORMAT_ITEMS={}; WIDE_FORMAT_ORDER=[]; PLU_SEARCH_ALIASES={}
     coverage_to_internal={"dalinis":"partial","pilnas":"full","brėžinys":"drawing","brezinys":"drawing","fiksuotas":"fixed"}
     for item in _data_rows(paths["codes_file"],"Items"):
         if str(item.get("active","taip")).strip().lower() not in ("taip","yes","1","true"): continue
@@ -4120,7 +4133,9 @@ def reload_editable_data():
         raw_coverage=str(item.get("wide_format_coverage","")).strip().lower()
         coverage=coverage_to_internal.get(raw_coverage,raw_coverage)
         label=str(item.get("wide_format_label_lt","")).strip()
-        if coverage or label: WIDE_FORMAT_ITEMS[code]=(name,PLU_PRICES.get(code,0.0),coverage or "fixed",label or name)
+        if coverage:
+            WIDE_FORMAT_ITEMS[code]=(name,PLU_PRICES.get(code,0.0),coverage,label or name)
+            WIDE_FORMAT_ORDER.append(code)
     PAPER_SIZES_MM={}
     for item in _data_rows(paths["paper_sizes_file"],"Sizes"):
         if str(item.get("active","taip")).strip().lower() not in ("taip","yes","1","true"): continue
@@ -4644,7 +4659,11 @@ class PrintCounterTab(tk.Frame):
             }
 
             lines = []
-            for code, (_description, price, item_coverage, item_label) in WIDE_FORMAT_ITEMS.items():
+            # Exact top-to-bottom order from copypro_kodai.xlsx.
+            for code in WIDE_FORMAT_ORDER:
+                item=WIDE_FORMAT_ITEMS.get(code)
+                if not item: continue
+                _description,price,item_coverage,item_label=item
                 searchable = f"{_description} {item_label}".lower()
                 if "vatman" in searchable or code in {"3008", "3009"}:
                     continue
