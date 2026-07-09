@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -18,6 +21,59 @@ SURFACE2 = "#23232E"
 ACCENT = "#5B6BFF"
 TEXT = "#F0F0F8"
 MUTED = "#7878A0"
+
+
+def is_running_as_admin() -> bool:
+    if not sys.platform.startswith("win"):
+        return True
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin() -> bool:
+    """Relaunch this updater through the Windows UAC prompt."""
+    if not sys.platform.startswith("win"):
+        return False
+
+    if getattr(sys, "frozen", False):
+        executable = str(Path(sys.executable).resolve())
+        arguments = sys.argv[1:]
+    else:
+        executable = str(Path(sys.executable).resolve())
+        arguments = [str(Path(__file__).resolve()), *sys.argv[1:]]
+
+    result = ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "runas",
+        executable,
+        subprocess.list2cmdline(arguments),
+        str(Path(executable).parent),
+        1,
+    )
+    return int(result) > 32
+
+
+def launch_app_normally(executable: Path) -> None:
+    """
+    Ask the normal Windows Explorer process to start the app.
+
+    The updater may be elevated, but the main CopyPro app should not stay
+    elevated because Windows blocks drag-and-drop from normal Explorer windows
+    into an administrator process.
+    """
+    if sys.platform.startswith("win"):
+        try:
+            subprocess.Popen(
+                ["explorer.exe", str(executable)],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return
+        except Exception:
+            pass
+
+    subprocess.Popen([str(executable)], cwd=str(executable.parent))
 
 
 def wait_for_process(pid: int, timeout: int = 45) -> None:
@@ -120,7 +176,7 @@ class UpdaterWindow(tk.Tk):
                     app_dir.replace(backup_dir)
                 new_dir.replace(app_dir)
                 self.set_status("Starting CopyPro Tools…", 97)
-                subprocess.Popen([str(executable)], cwd=str(app_dir))
+                launch_app_normally(executable)
                 shutil.rmtree(backup_dir, ignore_errors=True)
                 self.set_status("Update complete.", 100)
                 self.after(900, self.destroy)
@@ -147,4 +203,21 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    UpdaterWindow(parse_args()).mainloop()
+    args = parse_args()
+
+    if sys.platform.startswith("win") and not is_running_as_admin():
+        try:
+            if relaunch_as_admin():
+                raise SystemExit(0)
+        except Exception:
+            pass
+
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "Administrator permission is required to install this CopyPro Tools update.",
+            "CopyPro Tools update",
+            0x10,
+        )
+        raise SystemExit(1)
+
+    UpdaterWindow(args).mainloop()

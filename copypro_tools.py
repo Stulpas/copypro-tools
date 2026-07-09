@@ -1,6 +1,7 @@
 import tkinter as tk, time
 from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
-import os, sys, threading, subprocess, io, math, tempfile, shutil, unicodedata, difflib, json, csv, zipfile, webbrowser, base64, mimetypes, html
+import os, sys, threading, subprocess, io, math, tempfile, shutil, unicodedata, difflib, json, csv, zipfile, webbrowser, base64, mimetypes, html, gc, ctypes, queue
+from collections import OrderedDict
 from pathlib import Path
 from copypro_update_support import (
     current_version,
@@ -52,15 +53,7 @@ TEXT     = "#F0F0F8"
 MUTED    = "#7878A0"
 DROP_HL  = "#3B4BCC"
 
-PAPER_SIZES_MM = {
-    "A0": (841,1189), "A1": (594,841), "A2": (420,594),
-    "A3": (297,420), "A4": (210,297), "A5": (148,210),
-    "A6": (105,148), "A7": (74,105),
-    "SRA3": (320,450), "SRA4": (225,320),
-    "10×15 cm (102×152)": (102,152),
-    "21×15 cm (210×152)": (210,152),
-    "Square 10×10": (100,100), "Square 15×15": (150,150),
-}
+PAPER_SIZES_MM = {}
 DPI_OPTIONS = [72, 96, 150, 300, 600]
 
 def _copypro_data_dir():
@@ -83,6 +76,8 @@ APP_SETTINGS_FILE = os.path.join(COPYPRO_DATA_DIR, "settings.json")
 DEFAULT_CODES_FILE = os.path.join(COPYPRO_DATA_DIR, "copypro_kodai.xlsx")
 DEFAULT_PAPER_SIZES_FILE = os.path.join(COPYPRO_DATA_DIR, "copypro_popieriaus_dydziai.xlsx")
 DEFAULT_WIDE_FORMAT_FILE = DEFAULT_CODES_FILE
+BACKUPS_DIR = os.path.join(COPYPRO_DATA_DIR, "backups")
+os.makedirs(BACKUPS_DIR, exist_ok=True)
 
 def resource_path(filename):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -274,22 +269,42 @@ def parse_dropped_paths(data):
 
 # ── Drop Zone mixin ───────────────────────────────────────────────────────────
 class DropMixin:
-    """Call setup_drop(widget, callback, extensions) to enable DnD on a widget."""
-    def setup_drop(self, widget, callback, extensions=None):
+    """Reliable whole-tab file dropping with a non-flickering in-tab overlay."""
+
+    def setup_drop(self, widget, callback, extensions=None, root=None):
         if not HAS_DND:
             return
         try:
+            drop_root = root or getattr(widget, "_copypro_drop_root", widget)
+            widget._copypro_drop_root = drop_root
+            widget._copypro_drop_callback = callback
+            widget._copypro_drop_extensions = extensions
+            if getattr(widget, "_copypro_dnd_registered", False):
+                return
             widget.drop_target_register(dnd.DND_FILES)
-            widget.dnd_bind("<<DropEnter>>",  lambda e: self._drop_enter(widget))
-            widget.dnd_bind("<<DropLeave>>",  lambda e: self._drop_leave(widget))
-            widget.dnd_bind("<<Drop>>",       lambda e: self._on_drop(e, widget, callback, extensions))
+            widget.dnd_bind("<<DropEnter>>", lambda e, w=widget: self._drop_enter(w))
+            widget.dnd_bind("<<DropPosition>>", lambda e, w=widget: self._drop_enter(w))
+            widget.dnd_bind("<<DropLeave>>", lambda e, w=widget: self._drop_leave(w))
+            widget.dnd_bind(
+                "<<Drop>>",
+                lambda e, w=widget: self._on_drop(
+                    e,
+                    w,
+                    getattr(w, "_copypro_drop_callback", callback),
+                    getattr(w, "_copypro_drop_extensions", extensions),
+                ),
+            )
+            widget._copypro_dnd_registered = True
         except Exception:
             pass
 
     def setup_drop_everywhere(self, root, callback, extensions=None):
-        """Enable file dropping on the full tab, including rebuilt child widgets."""
+        root._copypro_drop_root = root
+        root._copypro_drop_callback = callback
+        root._copypro_drop_extensions = extensions
+
         def register_tree(widget):
-            self.setup_drop(widget, callback, extensions)
+            self.setup_drop(widget, callback, extensions, root=root)
             try:
                 for child in widget.winfo_children():
                     register_tree(child)
@@ -298,101 +313,184 @@ class DropMixin:
 
         register_tree(root)
 
+        # Pick up dynamically rebuilt cards without repeatedly rebinding old widgets.
         def refresh():
             try:
                 register_tree(root)
-                root.after(800, refresh)
+                root._copypro_drop_refresh_job = root.after(3000, refresh)
             except Exception:
                 pass
 
         try:
-            root.after(800, refresh)
+            old = getattr(root, "_copypro_drop_refresh_job", None)
+            if old:
+                root.after_cancel(old)
+            root._copypro_drop_refresh_job = root.after(3000, refresh)
         except Exception:
             pass
+
+    def _drop_root_for(self, widget):
+        return getattr(widget, "_copypro_drop_root", widget)
 
     def _show_drop_overlay(self, widget):
-        """Show themed drag feedback without recolouring the tab."""
+        """Show one childless in-tab canvas so drag enter/leave cannot flicker."""
         try:
-            root = widget.winfo_toplevel()
+            root=self._drop_root_for(widget)
+            hide_job=getattr(root,"_copypro_drop_hide_job",None)
+            if hide_job:
+                try:root.after_cancel(hide_job)
+                except Exception:pass
+                root._copypro_drop_hide_job=None
+
+            overlay=getattr(root,"_copypro_drop_overlay",None)
+            if overlay is None or not overlay.winfo_exists():
+                overlay=tk.Canvas(
+                    root,bg=SURFACE,highlightbackground=ACCENT,
+                    highlightthickness=3,bd=0,cursor="arrow"
+                )
+                root._copypro_drop_overlay=overlay
+                callback=getattr(root,"_copypro_drop_callback",None)
+                extensions=getattr(root,"_copypro_drop_extensions",None)
+                if callback:self.setup_drop(overlay,callback,extensions,root=root)
+                def redraw(_event=None,o=overlay):
+                    try:
+                        o.delete("all"); w=max(1,o.winfo_width()); h=max(1,o.winfo_height())
+                        o.create_text(w/2,h/2-12,text="DROP FILES HERE",fill=TEXT,
+                                      font=("Segoe UI",14,"bold"))
+                        o.create_text(w/2,h/2+16,text="Release to add the selected files",
+                                      fill=MUTED,font=("Segoe UI",9))
+                    except Exception:pass
+                overlay.bind("<Configure>",redraw)
+
+            overlay.place(relx=.5,rely=.5,anchor="center",width=330,height=100)
+            overlay.lift()
+        except Exception:pass
+
+    def _hide_drop_overlay_now(self, widget):
+        try:
+            root = self._drop_root_for(widget)
             overlay = getattr(root, "_copypro_drop_overlay", None)
             if overlay is not None and overlay.winfo_exists():
-                return
-
-            overlay = tk.Toplevel(root)
-            overlay.overrideredirect(True)
-            overlay.attributes("-topmost", True)
-            overlay.configure(bg=ACCENT)
-
-            frame = tk.Frame(
-                overlay,
-                bg=SURFACE,
-                highlightbackground=ACCENT,
-                highlightthickness=2,
-                padx=24,
-                pady=16,
-            )
-            frame.pack()
-            tk.Label(
-                frame,
-                text="DROP FILES HERE",
-                bg=SURFACE,
-                fg=TEXT,
-                font=("Segoe UI", 12, "bold"),
-            ).pack()
-            tk.Label(
-                frame,
-                text="Release to add the selected files",
-                bg=SURFACE,
-                fg=MUTED,
-                font=("Segoe UI", 9),
-            ).pack(pady=(4, 0))
-
-            root.update_idletasks()
-            overlay.update_idletasks()
-            x = root.winfo_rootx() + max(
-                0, (root.winfo_width() - overlay.winfo_reqwidth()) // 2
-            )
-            y = root.winfo_rooty() + max(
-                0, (root.winfo_height() - overlay.winfo_reqheight()) // 2
-            )
-            overlay.geometry(f"+{x}+{y}")
-            root._copypro_drop_overlay = overlay
+                overlay.place_forget()
+            root._copypro_drop_hide_job = None
         except Exception:
             pass
 
-    def _hide_drop_overlay(self, widget=None):
+    def _drop_enter(self, widget):
+        self._show_drop_overlay(widget)
+        return getattr(dnd, "COPY", "copy") if HAS_DND else None
+
+    def _drop_leave(self, widget):
+        # Child controls and the overlay can generate leave/enter pairs. Delay the
+        # hide briefly so the following enter cancels it instead of flickering.
         try:
-            root = widget.winfo_toplevel() if widget is not None else self.winfo_toplevel()
-            overlay = getattr(root, "_copypro_drop_overlay", None)
-            if overlay is not None and overlay.winfo_exists():
-                overlay.destroy()
-            root._copypro_drop_overlay = None
+            root = self._drop_root_for(widget)
+            old = getattr(root, "_copypro_drop_hide_job", None)
+            if old:
+                root.after_cancel(old)
+            root._copypro_drop_hide_job = root.after(
+                350,
+                lambda w=widget: self._hide_drop_overlay_now(w),
+            )
         except Exception:
             pass
-
-    def _drop_enter(self, w):
-        self._show_drop_overlay(w)
-
-    def _drop_leave(self, w):
-        self._hide_drop_overlay(w)
+        return getattr(dnd, "COPY", "copy") if HAS_DND else None
 
     def _on_drop(self, event, widget, callback, extensions):
-        self._hide_drop_overlay(widget)
+        self._hide_drop_overlay_now(widget)
         paths = parse_dropped_paths(event.data)
         filtered = []
-        for p in paths:
-            if os.path.isfile(p):
-                if extensions is None or os.path.splitext(p)[1].lower() in extensions:
-                    filtered.append(p)
-            elif os.path.isdir(p):
-                for f in os.listdir(p):
-                    fp = os.path.join(p, f)
-                    if os.path.isfile(fp):
-                        ext = os.path.splitext(fp)[1].lower()
+        for path in paths:
+            if os.path.isfile(path):
+                if extensions is None or os.path.splitext(path)[1].lower() in extensions:
+                    filtered.append(path)
+            elif os.path.isdir(path):
+                for name in os.listdir(path):
+                    candidate = os.path.join(path, name)
+                    if os.path.isfile(candidate):
+                        ext = os.path.splitext(candidate)[1].lower()
                         if extensions is None or ext in extensions:
-                            filtered.append(fp)
+                            filtered.append(candidate)
         if filtered:
             callback(filtered)
+        return getattr(dnd, "COPY", "copy") if HAS_DND else None
+
+class ImageMemoryCache:
+    """Byte-limited LRU cache that closes PIL images when evicted."""
+    def __init__(self, max_bytes):
+        self.max_bytes = int(max_bytes)
+        self.current_bytes = 0
+        self._items = OrderedDict()
+
+    @staticmethod
+    def _size(image):
+        try:
+            return image.width * image.height * max(1, len(image.getbands()))
+        except Exception:
+            return 0
+
+    def get(self, key, default=None):
+        value = self._items.get(key)
+        if value is None:
+            return default
+        self._items.move_to_end(key)
+        return value[0]
+
+    def __setitem__(self, key, image):
+        old = self._items.pop(key, None)
+        if old:
+            self.current_bytes -= old[1]
+            if old[0] is not image:
+                try: old[0].close()
+                except Exception: pass
+        size = self._size(image)
+        self._items[key] = (image, size)
+        self.current_bytes += size
+        while self.current_bytes > self.max_bytes and len(self._items) > 1:
+            _, (victim, victim_size) = self._items.popitem(last=False)
+            self.current_bytes -= victim_size
+            try: victim.close()
+            except Exception: pass
+
+    def clear(self):
+        for image, _size in self._items.values():
+            try: image.close()
+            except Exception: pass
+        self._items.clear()
+        self.current_bytes = 0
+
+    def __len__(self):
+        return len(self._items)
+
+
+def process_memory_mb():
+    try:
+        if sys.platform.startswith("win"):
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_ulong),
+                    ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(counters)
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+            return counters.WorkingSetSize / (1024 * 1024)
+        statm = Path("/proc/self/statm")
+        if statm.exists():
+            resident_pages = int(statm.read_text().split()[1])
+            return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except Exception:
+        pass
+    return 0.0
 
 # ── Crop Canvas ───────────────────────────────────────────────────────────────
 PREVIEW_MAX_DIM = 900  # cap preview image's long side in px — keeps UI fast
@@ -435,15 +533,25 @@ class CropCanvas(tk.Canvas):
     def _load(self, path):
         ext = os.path.splitext(path)[1].lower()
         if ext == ".pdf":
-            imgs = open_pdf_pages(path, dpi=72)
-            full = imgs[0].convert("RGB") if imgs else Image.new("RGB",(100,100))
+            doc = fitz.open(path)
+            try:
+                if len(doc):
+                    pix = doc[0].get_pixmap(matrix=fitz.Matrix(1,1), alpha=False)
+                    full = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                else:
+                    full = Image.new("RGB", (100,100))
+            finally:
+                doc.close()
         else:
-            raw = Image.open(path)
-            # Honour EXIF rotation so phone photos aren't sideways
-            raw = ImageOps.exif_transpose(raw)
-            full = raw.convert("RGB")
+            with Image.open(path) as opened:
+                corrected = ImageOps.exif_transpose(opened)
+                full = corrected.convert("RGB")
+                if corrected is not opened:
+                    try: corrected.close()
+                    except Exception: pass
 
         iw, ih = full.size
+        self.source_aspect_ratio = iw / max(1, ih)
         # Auto-rotate to match target orientation
         target_portrait = self.target_h >= self.target_w
         img_portrait    = ih >= iw
@@ -474,7 +582,11 @@ class CropCanvas(tk.Canvas):
         self.offset_x = (self.canvas_w-dw)//2
         self.offset_y = (self.canvas_h-dh)//2
         self.disp_w, self.disp_h, self.scale = dw, dh, scale
-        self.tk_img = ImageTk.PhotoImage(self.pil_img.resize((dw,dh), Image.LANCZOS))
+        resized = self.pil_img.resize((dw,dh), Image.Resampling.BILINEAR)
+        try:
+            self.tk_img = ImageTk.PhotoImage(resized)
+        finally:
+            resized.close()
 
     def rotate_manual(self, delta):
         """Rotate the preview (and the eventual export) by delta degrees (±90).
@@ -2396,6 +2508,16 @@ def save_print_layouts(layouts):
         with open(PRINT_LAYOUTS_FILE,"w",encoding="utf-8") as f: json.dump(layouts,f,indent=2)
     except Exception: pass
 
+    def destroy(self):
+        try:
+            if getattr(self, "pil_img", None) is not None:
+                self.pil_img.close()
+                self.pil_img = None
+            self.tk_img = None
+        except Exception:
+            pass
+        super().destroy()
+
 class PrintCropCanvas(CropCanvas):
     def __init__(self,*args,**kwargs):
         self.preview_grayscale=False; self.preview_brightness=100
@@ -2405,10 +2527,19 @@ class PrintCropCanvas(CropCanvas):
         dw,dh=max(1,int(iw*scale)),max(1,int(ih*scale))
         self.offset_x=(self.canvas_w-dw)//2; self.offset_y=(self.canvas_h-dh)//2
         self.disp_w,self.disp_h,self.scale=dw,dh,scale
-        shown=self.pil_img
-        if self.preview_grayscale: shown=ImageOps.grayscale(shown).convert("RGB")
-        if self.preview_brightness!=100: shown=ImageEnhance.Brightness(shown).enhance(self.preview_brightness/100)
-        self.tk_img=ImageTk.PhotoImage(shown.resize((dw,dh),Image.LANCZOS))
+        shown=self.pil_img; temporary=[]
+        if self.preview_grayscale:
+            shown=ImageOps.grayscale(shown).convert("RGB"); temporary.append(shown)
+        if self.preview_brightness!=100:
+            shown=ImageEnhance.Brightness(shown).enhance(self.preview_brightness/100); temporary.append(shown)
+        resized=shown.resize((dw,dh),Image.Resampling.BILINEAR)
+        try:self.tk_img=ImageTk.PhotoImage(resized)
+        finally:
+            resized.close()
+            for image in temporary:
+                if image is not self.pil_img:
+                    try:image.close()
+                    except Exception:pass
     def set_effects(self,gray,brightness):
         self.preview_grayscale=bool(gray); self.preview_brightness=int(brightness)
         self._fit_to_canvas(); self._draw()
@@ -2423,9 +2554,10 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         self.layouts=load_print_layouts()
         self.custom_sizes=load_custom_sizes()
         self._preview_job=None
-        self._preview_item_cache={}
-        self._preview_cache_limit=64
+        self._preview_item_cache=ImageMemoryCache(128 * 1024 * 1024)
         self.preview_images=[]
+        self._proportion_ratio=None
+        self._proportion_syncing=False
         self.pdf_sources={}
         self.display_names={}
         self._temp_dir=tempfile.mkdtemp(prefix="copypro_print_")
@@ -2477,14 +2609,47 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         self.item_w=tk.DoubleVar(value=90); self.item_h=tk.DoubleVar(value=50)
         self.item_w_input=tk.StringVar(value="90"); self.item_h_input=tk.StringVar(value="50")
         self.cols_var=tk.IntVar(value=2); self.rows_var=tk.IntVar(value=5)
-        for i,(caption,var) in enumerate((("Width",self.item_w_input),("Height",self.item_h_input))):
-            f=tk.Frame(size_row,bg=SURFACE); f.pack(side="left",fill="x",expand=True,padx=(0 if i==0 else 4,0))
-            lbl(f,caption+" (mm)",7,MUTED).pack(anchor="w"); e=entry(f,var,7); e.pack(fill="x")
-            e.bind("<Return>",self._apply_item_size); e.bind("<KP_Enter>",self._apply_item_size)
-        tk.Button(size_row,text="Update",command=self._apply_item_size,bg=ACCENT,fg="white",
-            relief="flat",font=("Segoe UI",7,"bold"),cursor="hand2",padx=6,pady=3).pack(side="left",padx=(5,0),pady=(11,0))
-        tk.Button(size_row,text="Presets",command=self._open_item_size_presets,bg=SURFACE2,fg=TEXT,
-            relief="flat",font=("Segoe UI",7,"bold"),cursor="hand2",padx=5,pady=3).pack(side="left",padx=(4,0),pady=(11,0))
+        dimensions=tk.Frame(size_row,bg=SURFACE); dimensions.pack(fill="x")
+
+        lbl(dimensions,"W:",8,MUTED,True).pack(side="left",padx=(0,4),pady=(1,0))
+        width_entry=entry(dimensions,self.item_w_input,8); width_entry.pack(side="left",fill="x",expand=True)
+        width_entry.bind("<KeyRelease>",lambda event:self._proportional_input_changed("width"))
+        width_entry.bind("<Return>",self._apply_item_size); width_entry.bind("<KP_Enter>",self._apply_item_size)
+
+        self.proportional_var=tk.BooleanVar(value=False)
+        self.chain_btn=tk.Button(
+            dimensions,
+            text="\U0001F517",
+            command=self._toggle_proportional,
+            width=3,
+            padx=0,
+            pady=2,
+            bg=SURFACE2,
+            fg=MUTED,
+            activebackground=SURFACE2,
+            activeforeground=TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=BORDER,
+            font=("Segoe UI Emoji",10),
+            cursor="hand2",
+            takefocus=True,
+        )
+        self.chain_btn.pack(side="left",padx=5)
+
+        lbl(dimensions,"H:",8,MUTED,True).pack(side="left",padx=(0,4),pady=(1,0))
+        height_entry=entry(dimensions,self.item_h_input,8); height_entry.pack(side="left",fill="x",expand=True)
+        height_entry.bind("<KeyRelease>",lambda event:self._proportional_input_changed("height"))
+        height_entry.bind("<Return>",self._apply_item_size); height_entry.bind("<KP_Enter>",self._apply_item_size)
+
+        size_actions=tk.Frame(left,bg=SURFACE); size_actions.pack(fill="x",padx=12,pady=(4,0))
+        tk.Button(size_actions,text="Update",command=self._apply_item_size,bg=ACCENT,fg="white",
+            relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2",padx=8,pady=4).pack(side="left",fill="x",expand=True)
+        tk.Button(size_actions,text="Presets",command=self._open_item_size_presets,bg=SURFACE2,fg=TEXT,
+            relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2",padx=8,pady=4).pack(side="left",fill="x",expand=True,padx=(5,0))
+        self._update_chain_button()
 
         def grid_spin(parent,label,var):
             f=tk.Frame(parent,bg=SURFACE)
@@ -2734,12 +2899,77 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         pw,ph=self._paper_mm(); iw=max(.1,self._num(self.item_w,90)); ih=max(.1,self._num(self.item_h,50)); cols=max(1,int(self._num(self.cols_var,1))); rows=max(1,int(self._num(self.rows_var,1))); gap=max(0,self._num(self.spacing_var,0)); bleed=max(0,self._num(self.bleed_mm,0)) if self.bleed_var.get() else 0
         gw=cols*iw+(cols-1)*gap+2*bleed; gh=rows*ih+(rows-1)*gap+2*bleed; x0=(pw-gw)/2+bleed; y0=(ph-gh)/2+bleed
         return pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,gw,gh
+    def _first_source_ratio(self):
+        if not self.files:
+            return None
+        first=self.files[0]
+        canvas=next((c for path,c in self.canvases if path==first),None)
+        if canvas is not None:
+            ratio=float(getattr(canvas,"source_aspect_ratio",0) or 0)
+            if ratio>0:return ratio
+        try:
+            if first in self.pdf_sources:
+                pdf_path,page_no=self.pdf_sources[first]
+                doc=fitz.open(pdf_path)
+                try:
+                    rect=doc[page_no].rect
+                    return rect.width/max(1e-6,rect.height)
+                finally:doc.close()
+            with Image.open(first) as image:
+                corrected=ImageOps.exif_transpose(image)
+                return corrected.width/max(1,corrected.height)
+        except Exception:return None
+
+    def _update_chain_button(self):
+        if not hasattr(self,"chain_btn"):return
+        linked=bool(self.proportional_var.get())
+        self.chain_btn.config(
+            text="\U0001F517",
+            bg=ACCENT if linked else SURFACE2,
+            fg="white" if linked else MUTED,
+            activebackground=ACCENT if linked else SURFACE2,
+            activeforeground="white" if linked else TEXT,
+            highlightbackground=ACCENT if linked else BORDER,
+            highlightcolor=ACCENT if linked else BORDER,
+            relief="sunken" if linked else "flat",
+        )
+
+    def _toggle_proportional(self):
+        self.proportional_var.set(not self.proportional_var.get())
+        if self.proportional_var.get():
+            ratio=self._first_source_ratio()
+            if not ratio:
+                self.proportional_var.set(False)
+                self._update_chain_button()
+                messagebox.showinfo("Proportional sizing","Add at least one source image or PDF page first.",parent=self)
+                return
+            self._proportion_ratio=ratio
+            self._proportional_input_changed("width")
+            self.status.config(text="Linked sizing uses the first source image ratio.",fg=MUTED)
+        else:self._proportion_ratio=None
+        self._update_chain_button()
+
+    def _proportional_input_changed(self,axis):
+        if not self.proportional_var.get() or self._proportion_syncing:return
+        ratio=self._proportion_ratio or self._first_source_ratio()
+        if not ratio or ratio<=0:return
+        try:
+            self._proportion_syncing=True
+            if axis=="width":
+                value=float(self.item_w_input.get().replace(",","."))
+                if value>0:self.item_h_input.set(f"{value/ratio:.2f}".rstrip("0").rstrip("."))
+            else:
+                value=float(self.item_h_input.get().replace(",","."))
+                if value>0:self.item_w_input.set(f"{value*ratio:.2f}".rstrip("0").rstrip("."))
+        except Exception:pass
+        finally:self._proportion_syncing=False
+
     def _set_item_size(self,width,height,refresh=True):
         width=max(.1,float(width)); height=max(.1,float(height))
         self.item_w.set(width); self.item_h.set(height)
         self.item_w_input.set(f"{width:g}"); self.item_h_input.set(f"{height:g}")
         if not hasattr(self,"_preview_item_cache"):
-            self._preview_item_cache={}
+            self._preview_item_cache=ImageMemoryCache(128 * 1024 * 1024)
         self._preview_item_cache.clear()
         if refresh:self._rebuild()
 
@@ -2843,8 +3073,11 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         self._preview_job=self.after(180,self._draw_preview)
     def _draw_preview(self):
         self._preview_job=None
-        for child in self.preview_frame.winfo_children(): child.destroy()
+        for photo in self.preview_images:
+            try:photo.__del__()
+            except Exception:pass
         self.preview_images.clear()
+        for child in self.preview_frame.winfo_children(): child.destroy()
         try:
             pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,gw,gh=self._metrics()
         except Exception:
@@ -2877,6 +3110,7 @@ class PrintLayoutTab(tk.Frame,DropMixin):
                 scale=min(card_w/sheet.width,max_h/sheet.height,1.0)
                 shown=sheet.resize((max(1,int(sheet.width*scale)),max(1,int(sheet.height*scale))),Image.Resampling.BILINEAR)
                 photo=ImageTk.PhotoImage(shown)
+                shown.close(); sheet.close()
                 self.preview_images.append(photo)
                 tk.Label(card,image=photo,bg=SURFACE2,bd=0,highlightbackground=BORDER,highlightthickness=1).pack()
                 tk.Label(card,text=label,bg=SURFACE,fg=TEXT,font=("Segoe UI",8,"bold"),wraplength=card_w).pack(fill="x",pady=(5,0))
@@ -2911,9 +3145,20 @@ class PrintLayoutTab(tk.Frame,DropMixin):
                 self.files.append(p); self.display_names[p]=os.path.basename(p); changed=True
         if changed:self._rebuild()
     def _clear(self):
-        self._preview_item_cache.clear(); self.files.clear(); self.canvases.clear(); self.pdf_sources.clear(); self.display_names.clear(); self._show_empty()
+        self._preview_item_cache.clear()
+        for photo in self.preview_images:
+            try:photo.__del__()
+            except Exception:pass
+        self.preview_images.clear()
+        for path in list(self.pdf_sources):
+            try:os.remove(path)
+            except Exception:pass
+        self.files.clear(); self.canvases.clear(); self.pdf_sources.clear(); self.display_names.clear(); self._show_empty(); gc.collect()
     def _remove(self,path):
         if path in self.files:self.files.remove(path)
+        if path in self.pdf_sources:
+            try:os.remove(path)
+            except Exception:pass
         self.pdf_sources.pop(path,None); self.display_names.pop(path,None); self._rebuild()
     def _move_source(self,path,direction):
         if path not in self.files:return
@@ -3001,67 +3246,66 @@ class PrintLayoutTab(tk.Frame,DropMixin):
                     wraplength=220,
                 ).pack(fill="x",padx=4,pady=12)
         self._schedule_preview()
+        gc.collect(0)
     def _current_layout(self):
-        return {"paper":self.paper_var.get(),"orientation":self.orientation_var.get(),"item_w":self._num(self.item_w,90),"item_h":self._num(self.item_h,50),"cols":int(self._num(self.cols_var,2)),"rows":int(self._num(self.rows_var,5)),"mode":self.mode_var.get(),"duplex":self.duplex_var.get(),"bleed":self.bleed_var.get(),"bleed_mm":self._num(self.bleed_mm,3),"spacing":self._num(self.spacing_var,6),"grayscale":self.gray_var.get(),"brightness":int(self.brightness_var.get()),"dpi":int(self.dpi_var.get()),"cut_marks":self.cut_marks_var.get(),"cut_labels":self.cut_labels_var.get()}
+        return {"paper":self.paper_var.get(),"orientation":self.orientation_var.get(),"item_w":self._num(self.item_w,90),"item_h":self._num(self.item_h,50),"cols":int(self._num(self.cols_var,2)),"rows":int(self._num(self.rows_var,5)),"mode":self.mode_var.get(),"duplex":self.duplex_var.get(),"bleed":self.bleed_var.get(),"bleed_mm":self._num(self.bleed_mm,3),"spacing":self._num(self.spacing_var,6),"grayscale":self.gray_var.get(),"brightness":int(self.brightness_var.get()),"dpi":int(self.dpi_var.get()),"cut_marks":self.cut_marks_var.get(),"cut_labels":self.cut_labels_var.get(),"proportional":self.proportional_var.get(),"proportion_ratio":self._proportion_ratio}
     def _load_layout(self,name):
         d=self.layouts.get(name)
         if not d:return
-        self.layout_var.set(name); self.paper_var.set(d.get("paper","A4")); self.orientation_var.set(d.get("orientation","Portrait")); self._set_item_size(d.get("item_w",90),d.get("item_h",50),False); self.cols_var.set(d.get("cols",2)); self.rows_var.set(d.get("rows",5)); self.mode_var.set(d.get("mode","Repeat")); self.duplex_var.set(d.get("duplex",False)); self.bleed_var.set(d.get("bleed",False)); self.bleed_mm.set(d.get("bleed_mm",3)); self.spacing_var.set(d.get("spacing",0)); self.gray_var.set(d.get("grayscale",False)); self.brightness_var.set(d.get("brightness",100)); self.dpi_var.set(d.get("dpi",300)); self.cut_marks_var.set(d.get("cut_marks",False)); self.cut_labels_var.set(d.get("cut_labels",False)); self._toggle_cut_marks(); self.brightness_lbl.config(text=f"Brightness: {self.brightness_var.get()}%"); self._toggle_bleed(); self._mode_changed()
+        self.layout_var.set(name); self.paper_var.set(d.get("paper","A4")); self.orientation_var.set(d.get("orientation","Portrait")); self._set_item_size(d.get("item_w",90),d.get("item_h",50),False); self.cols_var.set(d.get("cols",2)); self.rows_var.set(d.get("rows",5)); self.mode_var.set(d.get("mode","Repeat")); self.duplex_var.set(d.get("duplex",False)); self.bleed_var.set(d.get("bleed",False)); self.bleed_mm.set(d.get("bleed_mm",3)); self.spacing_var.set(d.get("spacing",0)); self.gray_var.set(d.get("grayscale",False)); self.brightness_var.set(d.get("brightness",100)); self.dpi_var.set(d.get("dpi",300)); self.cut_marks_var.set(d.get("cut_marks",False)); self.cut_labels_var.set(d.get("cut_labels",False)); self.proportional_var.set(bool(d.get("proportional",False))); self._proportion_ratio=d.get("proportion_ratio"); self._update_chain_button(); self._toggle_cut_marks(); self.brightness_lbl.config(text=f"Brightness: {self.brightness_var.get()}%"); self._toggle_bleed(); self._mode_changed()
     def _save_layout_dialog(self):
         name=simpledialog.askstring("Save layout","Layout name:",initialvalue=self.layout_var.get(),parent=self)
         if not name:return
         name=name.strip(); self.layouts[name]=self._current_layout(); save_print_layouts(self.layouts); self.layout_cb.config(values=list(self.layouts)); self.layout_var.set(name); self.status.config(text=f"Saved layout: {name}",fg=SUCCESS)
     def _processed(self,path,cc,target_px=None,preview=False):
         if path in self.pdf_sources:
-            # PDFs are resolution-independent when they contain vector artwork. Render
-            # each page specifically for its final placed size, with 2x supersampling,
-            # instead of reusing the low-resolution preview or a fixed raster DPI.
             pdf_path,page_no=self.pdf_sources[path]
             doc=fitz.open(pdf_path)
-            page=doc[page_no]
-            l,t,r,b=cc.get_crop_fractions()
-            frac_w=max(0.001,r-l); frac_h=max(0.001,b-t)
-            page_w,page_h=page.rect.width,page.rect.height
-            if cc.total_rotation in (90,270):
-                page_w,page_h=page_h,page_w
-            if target_px:
-                target_w,target_h=target_px; multiplier=1.15 if preview else 2
-                scale=max((target_w*multiplier)/(page_w*frac_w),
-                          (target_h*multiplier)/(page_h*frac_h))
-                render_dpi=(max(45,min(100,int(math.ceil(scale*72)))) if preview else
-                            max(int(self.dpi_var.get()),min(1200,int(math.ceil(scale*72)))))
-            else:render_dpi=90 if preview else max(600,int(self.dpi_var.get())*2)
-            pix=page.get_pixmap(matrix=fitz.Matrix(render_dpi/72,render_dpi/72),alpha=False)
-            raw=Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
-            doc.close()
+            try:
+                page=doc[page_no]; l,t,r,b=cc.get_crop_fractions()
+                frac_w=max(.001,r-l); frac_h=max(.001,b-t)
+                page_w,page_h=page.rect.width,page.rect.height
+                if cc.total_rotation in (90,270):page_w,page_h=page_h,page_w
+                if target_px:
+                    target_w,target_h=target_px; multiplier=1.15 if preview else 2
+                    scale=max((target_w*multiplier)/(page_w*frac_w),(target_h*multiplier)/(page_h*frac_h))
+                    render_dpi=(max(45,min(100,int(math.ceil(scale*72)))) if preview else max(int(self.dpi_var.get()),min(1200,int(math.ceil(scale*72)))))
+                else:render_dpi=90 if preview else max(600,int(self.dpi_var.get())*2)
+                pix=page.get_pixmap(matrix=fitz.Matrix(render_dpi/72,render_dpi/72),alpha=False)
+                raw=Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
+            finally:doc.close()
         else:
-            source=ImageOps.exif_transpose(Image.open(path))
-            if preview:
-                limit=max(600,min(1400,max(target_px or (900,900))*2))
-                source.thumbnail((limit,limit),Image.Resampling.BILINEAR)
-            raw=source.convert("RGB")
-        if cc.total_rotation:raw=raw.rotate(cc.total_rotation,expand=True)
-        iw,ih=raw.size; l,t,r,b=cc.get_crop_fractions(); raw=raw.crop((int(l*iw),int(t*ih),int(r*iw),int(b*ih)))
-        if self.gray_var.get():raw=ImageOps.grayscale(raw).convert("RGB")
-        if self.brightness_var.get()!=100:raw=ImageEnhance.Brightness(raw).enhance(self.brightness_var.get()/100)
+            with Image.open(path) as opened:
+                corrected=ImageOps.exif_transpose(opened)
+                if preview:
+                    limit=max(600,min(1400,max(target_px or (900,900))*2))
+                    corrected.thumbnail((limit,limit),Image.Resampling.BILINEAR)
+                raw=corrected.convert("RGB")
+                if corrected is not opened:
+                    try:corrected.close()
+                    except Exception:pass
+        if cc.total_rotation:
+            rotated=raw.rotate(cc.total_rotation,expand=True); raw.close(); raw=rotated
+        iw,ih=raw.size; l,t,r,b=cc.get_crop_fractions()
+        cropped=raw.crop((int(l*iw),int(t*ih),int(r*iw),int(b*ih))); raw.close(); raw=cropped
+        if self.gray_var.get():
+            converted=ImageOps.grayscale(raw).convert("RGB"); raw.close(); raw=converted
+        if self.brightness_var.get()!=100:
+            adjusted=ImageEnhance.Brightness(raw).enhance(self.brightness_var.get()/100); raw.close(); raw=adjusted
         return raw
     def _item(self,path,cc,dpi,iw,ih,bleed,preview=False):
         target=(mm_to_px(iw,dpi),mm_to_px(ih,dpi)); key=None
         if preview:
-            key=(path,tuple(round(v,4) for v in cc.get_crop_fractions()),
-                 int(cc.total_rotation),target,round(float(bleed),2),
-                 bool(self.gray_var.get()),int(self.brightness_var.get()))
-            if key in self._preview_item_cache:return self._preview_item_cache[key]
+            key=(path,tuple(round(v,4) for v in cc.get_crop_fractions()),int(cc.total_rotation),target,round(float(bleed),2),bool(self.gray_var.get()),int(self.brightness_var.get()))
+            cached=self._preview_item_cache.get(key)
+            if cached is not None:return cached
         img=self._processed(path,cc,target,preview)
         if img.width and img.height and (img.width>img.height)!=(target[0]>target[1]):
-            img=img.rotate(90,expand=True)
-        img=ImageOps.fit(img,target,method=(Image.Resampling.BILINEAR if preview else
-                         Image.Resampling.LANCZOS),centering=(.5,.5))
-        if bleed>0:img=add_bleed_and_marks(img,bleed,dpi,False)
-        if preview:
-            if len(self._preview_item_cache)>=self._preview_cache_limit:
-                self._preview_item_cache.pop(next(iter(self._preview_item_cache)),None)
-            self._preview_item_cache[key]=img
+            rotated=img.rotate(90,expand=True); img.close(); img=rotated
+        fitted=ImageOps.fit(img,target,method=(Image.Resampling.BILINEAR if preview else Image.Resampling.LANCZOS),centering=(.5,.5)); img.close(); img=fitted
+        if bleed>0:
+            finished=add_bleed_and_marks(img,bleed,dpi,False); img.close(); img=finished
+        if preview:self._preview_item_cache[key]=img
         return img
 
     def _sheet(self,assignments,back=False,dpi_override=None,preview_guides=False):
@@ -3070,7 +3314,13 @@ class PrintLayoutTab(tk.Frame,DropMixin):
             if not path or path not in by:continue
             row=slot//cols; col=slot%cols
             if back:col=cols-1-col
-            item=self._item(path,by[path],dpi,iw,ih,bleed,preview=(dpi_override is not None)); tx=x0+col*(iw+gap)-bleed; ty=y0+row*(ih+gap)-bleed; sheet.paste(item,(mm_to_px(tx,dpi),mm_to_px(ty,dpi)))
+            is_preview=dpi_override is not None
+            item=self._item(path,by[path],dpi,iw,ih,bleed,preview=is_preview)
+            tx=x0+col*(iw+gap)-bleed; ty=y0+row*(ih+gap)-bleed
+            sheet.paste(item,(mm_to_px(tx,dpi),mm_to_px(ty,dpi)))
+            if not is_preview:
+                try:item.close()
+                except Exception:pass
         if self.cut_marks_var.get(): self._draw_cut_guides(sheet,pw,ph,iw,ih,cols,rows,gap,bleed,x0,y0,dpi)
         if preview_guides:
             draw=ImageDraw.Draw(sheet)
@@ -3191,6 +3441,23 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         return specs
     def _pages(self):
         return [self._sheet(assignments,back=back) for assignments,back,_label in self._page_specs()]
+    def _write_layout_pdf(self,out):
+        pdf=fitz.open(); pw,ph=self._paper_mm()
+        try:
+            for index,(assignments,back,_label) in enumerate(self._page_specs()):
+                sheet=self._sheet(assignments,back=back); buffer=io.BytesIO()
+                try:
+                    sheet.save(buffer,"PNG",compress_level=3)
+                    page=pdf.new_page(width=pw*72/25.4,height=ph*72/25.4)
+                    page.insert_image(page.rect,stream=buffer.getvalue())
+                finally:
+                    buffer.close(); sheet.close()
+                if index and index%4==0:gc.collect(0)
+            if not len(pdf):raise ValueError("No output pages were generated.")
+            pdf.save(out,garbage=3,deflate=True)
+        finally:
+            pdf.close(); gc.collect()
+
     def _ctrl_p(self,event=None):
         focused=self.focus_get()
         if isinstance(focused,(tk.Entry,ttk.Entry,tk.Text)):
@@ -3210,8 +3477,7 @@ class PrintLayoutTab(tk.Frame,DropMixin):
     def _prepare_print_pdf(self):
         try:
             out=os.path.join(tempfile.gettempdir(),f"CopyPro_Print_{int(time.time())}.pdf")
-            pages=self._pages(); dpi=int(self.dpi_var.get())
-            pages[0].save(out,"PDF",save_all=True,append_images=pages[1:],resolution=dpi,quality=100,subsampling=0,optimize=False)
+            self._write_layout_pdf(out)
             self.after(0,lambda p=out:self._open_acrobat_print(p))
         except Exception as ex:
             self.after(0,lambda e=ex:messagebox.showerror("Print failed",str(e)))
@@ -3252,19 +3518,777 @@ class PrintLayoutTab(tk.Frame,DropMixin):
         self.export_btn.config(state="disabled"); self.status.config(text="Exporting…",fg=MUTED); threading.Thread(target=self._do_export,args=(out,),daemon=True).start()
     def _do_export(self,out):
         try:
-            pages=self._pages(); dpi=int(self.dpi_var.get()); pages[0].save(out,"PDF",save_all=True,append_images=pages[1:],resolution=dpi,quality=95,subsampling=0,optimize=True)
-            self.after(0,lambda:self.status.config(text=f"Exported {len(pages)} PDF page(s)",fg=SUCCESS)); self.after(0,lambda:messagebox.showinfo("Done",f"Print layout exported to:\n{out}"))
+            page_count=len(self._page_specs()); self._write_layout_pdf(out)
+            self.after(0,lambda:self.status.config(text=f"Exported {page_count} PDF page(s)",fg=SUCCESS)); self.after(0,lambda:messagebox.showinfo("Done",f"Print layout exported to:\n{out}"))
         except Exception as ex:
             self.after(0,lambda e=ex:messagebox.showerror("Export failed",str(e))); self.after(0,lambda:self.status.config(text="Export failed",fg=DANGER))
         finally:self.after(0,lambda:self.export_btn.config(state="normal"))
 
+    def clear_memory_cache(self):
+        self._preview_item_cache.clear()
+        for photo in self.preview_images:
+            try:photo.__del__()
+            except Exception:pass
+        self.preview_images.clear(); gc.collect(); self._schedule_preview()
+
     def destroy(self):
         try:
             self.unbind_all("<Control-p>"); self.unbind_all("<Control-P>")
+            if self._preview_job:self.after_cancel(self._preview_job)
+            refresh=getattr(self,"_copypro_drop_refresh_job",None)
+            if refresh:self.after_cancel(refresh)
         except Exception: pass
+        self._preview_item_cache.clear()
+        for photo in self.preview_images:
+            try:photo.__del__()
+            except Exception:pass
+        self.preview_images.clear()
         try: shutil.rmtree(self._temp_dir,ignore_errors=True)
         except Exception: pass
-        super().destroy()
+        gc.collect(); super().destroy()
+
+
+
+
+# ── Polaroid Maker Tab ───────────────────────────────────────────────────────
+class PolaroidMakerTab(tk.Frame,DropMixin):
+    """Arrange movable photo crops inside white instant-photo frames on SRA sheets."""
+    PRESETS=OrderedDict([
+        ("Classic 88 × 107 mm",(88.0,107.0,4.5,5.0,25.0,"Square")),
+        ("Mini 54 × 86 mm",(54.0,86.0,4.0,4.0,20.0,"3:4")),
+        ("Square 72 × 86 mm",(72.0,86.0,5.0,5.0,19.0,"Square")),
+        ("Wide 108 × 86 mm",(108.0,86.0,4.5,5.0,19.0,"3:2")),
+        ("Custom",(88.0,107.0,5.0,5.0,25.0,"Square")),
+    ])
+    RATIOS={"Square":1.0,"3:4":3/4,"2:3":2/3,"3:2":3/2,"4:5":4/5}
+
+    def __init__(self,parent):
+        super().__init__(parent,bg=BG)
+        self.files=[]; self.canvases=[]; self.display_names={}
+        self._temp_dir=tempfile.mkdtemp(prefix="copypro_polaroid_")
+        self._generated=[]; self._preview_job=None; self.preview_photo=None
+        self._build(); self._preset_changed()
+
+    def _build(self):
+        self.grid_rowconfigure(0,weight=4)
+        self.grid_rowconfigure(1,weight=1,minsize=190)
+        self.grid_columnconfigure(0,weight=0)
+        self.grid_columnconfigure(1,weight=1)
+
+        left=tk.Frame(self,bg=SURFACE,width=278)
+        left.grid(row=0,column=0,rowspan=2,sticky="nsew")
+        left.grid_propagate(False)
+        lbl(left,"POLAROID MAKER",9,MUTED,True).pack(anchor="w",padx=14,pady=(12,5))
+        tk.Label(left,text="Create white instant-photo frames and arrange them automatically on SRA4 or SRA3.",
+                 bg=SURFACE,fg=MUTED,font=("Segoe UI",8),wraplength=245,justify="left").pack(anchor="w",padx=14,pady=(0,8))
+
+        lbl(left,"Frame preset",8).pack(anchor="w",padx=14)
+        self.preset_var=tk.StringVar(value="Classic 88 × 107 mm")
+        self.preset_cb=ttk.Combobox(left,textvariable=self.preset_var,values=list(self.PRESETS),state="readonly")
+        self.preset_cb.pack(fill="x",padx=14,pady=(2,5)); self.preset_cb.bind("<<ComboboxSelected>>",lambda e:self._preset_changed())
+
+        dimensions=tk.Frame(left,bg=SURFACE); dimensions.pack(fill="x",padx=14)
+        self.outer_w_var=tk.StringVar(value="88"); self.outer_h_var=tk.StringVar(value="107")
+        for i,(caption,var) in enumerate((("Width mm",self.outer_w_var),("Height mm",self.outer_h_var))):
+            f=tk.Frame(dimensions,bg=SURFACE); f.grid(row=0,column=i,sticky="ew",padx=(0 if i==0 else 5,0)); dimensions.grid_columnconfigure(i,weight=1)
+            lbl(f,caption,7,MUTED).pack(anchor="w"); entry(f,var,7).pack(fill="x")
+
+        lbl(left,"Image crop ratio",8).pack(anchor="w",padx=14,pady=(7,0))
+        self.ratio_var=tk.StringVar(value="Square")
+        self.ratio_cb=ttk.Combobox(left,textvariable=self.ratio_var,
+            values=["Square","3:4","2:3","3:2","4:5","Original","Custom"],state="readonly")
+        self.ratio_cb.pack(fill="x",padx=14,pady=(2,2)); self.ratio_cb.bind("<<ComboboxSelected>>",lambda e:self._ratio_changed())
+        self.custom_ratio_frame=tk.Frame(left,bg=SURFACE)
+        lbl(self.custom_ratio_frame,"Custom W:H",7,MUTED).pack(side="left")
+        self.custom_ratio_w=tk.StringVar(value="4"); self.custom_ratio_h=tk.StringVar(value="5")
+        entry(self.custom_ratio_frame,self.custom_ratio_w,5).pack(side="left",padx=(6,3)); lbl(self.custom_ratio_frame,":",8,MUTED).pack(side="left"); entry(self.custom_ratio_frame,self.custom_ratio_h,5).pack(side="left",padx=(3,0))
+
+        sep(left); lbl(left,"WHITE FRAME MARGINS",8,MUTED,True).pack(anchor="w",padx=14)
+        self.side_margin_var=tk.StringVar(value="4.5"); self.top_margin_var=tk.StringVar(value="5"); self.bottom_margin_var=tk.StringVar(value="25")
+        margins=tk.Frame(left,bg=SURFACE); margins.pack(fill="x",padx=14,pady=(3,2))
+        for i,(caption,var) in enumerate((("Sides",self.side_margin_var),("Top",self.top_margin_var),("Bottom",self.bottom_margin_var))):
+            f=tk.Frame(margins,bg=SURFACE); f.grid(row=0,column=i,sticky="ew",padx=(0 if i==0 else 4,0)); margins.grid_columnconfigure(i,weight=1)
+            lbl(f,caption+" mm",7,MUTED).pack(anchor="w"); entry(f,var,5).pack(fill="x")
+        styled_btn(left,"Apply frame settings",self._apply_frame_settings,style="secondary").pack(fill="x",padx=14,pady=(4,5))
+
+        sep(left); lbl(left,"SHEET LAYOUT",8,MUTED,True).pack(anchor="w",padx=14)
+        sheet_row=tk.Frame(left,bg=SURFACE); sheet_row.pack(fill="x",padx=14,pady=(3,2))
+        self.sheet_var=tk.StringVar(value="SRA4")
+        ttk.Combobox(sheet_row,textvariable=self.sheet_var,values=["SRA4","SRA3"],state="readonly",width=8).pack(side="left",fill="x",expand=True)
+        self.spacing_var=tk.StringVar(value="3")
+        lbl(sheet_row,"Spacing",7,MUTED).pack(side="left",padx=(7,3)); entry(sheet_row,self.spacing_var,5).pack(side="left"); lbl(sheet_row,"mm",7,MUTED).pack(side="left",padx=(2,0))
+
+        self.auto_layout_var=tk.BooleanVar(value=True)
+        tk.Checkbutton(left,text="Automatic rows, columns and rotation",variable=self.auto_layout_var,
+            bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",8),command=self._layout_mode_changed).pack(anchor="w",padx=14,pady=(3,1))
+        manual=tk.Frame(left,bg=SURFACE); manual.pack(fill="x",padx=14)
+        self.cols_var=tk.IntVar(value=2); self.rows_var=tk.IntVar(value=2)
+        self.manual_spins=[]
+        for i,(caption,var) in enumerate((("Columns",self.cols_var),("Rows",self.rows_var))):
+            f=tk.Frame(manual,bg=SURFACE); f.grid(row=0,column=i,sticky="ew",padx=(0 if i==0 else 5,0)); manual.grid_columnconfigure(i,weight=1)
+            lbl(f,caption,7,MUTED).pack(anchor="w")
+            sp=tk.Spinbox(f,from_=1,to=20,textvariable=var,bg=SURFACE2,fg=TEXT,insertbackground=TEXT,
+                          buttonbackground=SURFACE2,relief="flat",font=("Segoe UI",9),command=self._schedule_preview)
+            sp.pack(fill="x"); sp.bind("<KeyRelease>",lambda e:self._schedule_preview()); self.manual_spins.append(sp)
+        lbl(left,"Cut guide",7,MUTED).pack(anchor="w",padx=14,pady=(5,0))
+        self.mark_mode_var=tk.StringVar(value="Crop marks")
+        self.mark_mode_cb=ttk.Combobox(
+            left,textvariable=self.mark_mode_var,
+            values=["Crop marks","Outline 0.15 mm"],state="readonly"
+        )
+        self.mark_mode_cb.pack(fill="x",padx=14,pady=(2,3))
+        self.mark_mode_cb.bind("<<ComboboxSelected>>",lambda _event:self._schedule_preview())
+
+        actions=tk.Frame(left,bg=SURFACE); actions.pack(fill="x",padx=14,pady=(4,2))
+        styled_btn(actions,"Add images",self._add_files).pack(side="left",fill="x",expand=True)
+        styled_btn(actions,"Clear",self._clear,style="secondary").pack(side="left",fill="x",expand=True,padx=(5,0))
+        self.export_btn=styled_btn(left,"Export print-ready PDF",self._export_pdf,style="success")
+        self.export_btn.pack(fill="x",padx=14,pady=(4,3))
+        self.status=lbl(left,"Add images or a PDF.",8,MUTED); self.status.pack(fill="x",padx=14,pady=(0,10))
+
+        # The sheet preview is the primary workspace and gets most of the tab.
+        preview_panel=tk.Frame(self,bg=SURFACE,highlightbackground=BORDER,highlightthickness=1)
+        preview_panel.grid(row=0,column=1,sticky="nsew",padx=8,pady=(8,4))
+        preview_panel.grid_rowconfigure(1,weight=1)
+        preview_panel.grid_columnconfigure(0,weight=1)
+        hdr=tk.Frame(preview_panel,bg=SURFACE)
+        hdr.grid(row=0,column=0,sticky="ew",padx=12,pady=(9,5))
+        lbl(hdr,"SHEET PREVIEW",9,MUTED,True).pack(side="left")
+        self.preview_info=lbl(hdr,"",8,MUTED); self.preview_info.pack(side="right")
+        self.preview_canvas=tk.Canvas(preview_panel,bg=BG,highlightthickness=0)
+        self.preview_canvas.grid(row=1,column=0,sticky="nsew",padx=8,pady=(0,8))
+        self.preview_canvas.bind("<Configure>",lambda _event:self._schedule_preview())
+
+        # Smaller crop cards sit in a horizontal strip under the sheet preview.
+        crops_panel=tk.Frame(self,bg=BG)
+        crops_panel.grid(row=1,column=1,sticky="nsew",padx=8,pady=(4,8))
+        crops_panel.grid_rowconfigure(1,weight=1)
+        crops_panel.grid_columnconfigure(0,weight=1)
+        head=tk.Frame(crops_panel,bg=BG)
+        head.grid(row=0,column=0,sticky="ew",pady=(0,4))
+        lbl(head,"IMAGE CROPS",9,MUTED,True).pack(side="left")
+        self.count_lbl=lbl(head,"0 images",8,MUTED); self.count_lbl.pack(side="right")
+        self.cards_canvas=tk.Canvas(crops_panel,bg=BG,highlightthickness=0,height=158)
+        self.cards_canvas.grid(row=1,column=0,sticky="nsew")
+        crop_scroll=ttk.Scrollbar(crops_panel,orient="horizontal",command=self.cards_canvas.xview)
+        crop_scroll.grid(row=2,column=0,sticky="ew",pady=(3,0))
+        self.cards_canvas.config(xscrollcommand=crop_scroll.set)
+        self.cards_frame=tk.Frame(self.cards_canvas,bg=BG)
+        self.cards_win=self.cards_canvas.create_window((0,0),window=self.cards_frame,anchor="nw")
+        self.cards_frame.bind("<Configure>",lambda _event:self.cards_canvas.config(scrollregion=self.cards_canvas.bbox("all")))
+        self.cards_canvas.bind("<Configure>",lambda event:self.cards_canvas.itemconfig(self.cards_win,height=max(1,event.height)))
+        def crop_wheel(event):
+            self.cards_canvas.xview_scroll(int(-event.delta/120),"units")
+            return "break"
+        self.cards_canvas.bind("<Enter>",lambda _event:self.cards_canvas.bind_all("<MouseWheel>",crop_wheel))
+        self.cards_canvas.bind("<Leave>",lambda _event:self.cards_canvas.unbind_all("<MouseWheel>"))
+
+        self._layout_mode_changed(); self._show_empty()
+
+    def _num(self,var,default):
+        try:return float(str(var.get()).replace(",","."))
+        except Exception:return default
+
+    def _preset_changed(self):
+        w,h,side,top,bottom,ratio=self.PRESETS.get(self.preset_var.get(),self.PRESETS["Classic 88 × 107 mm"])
+        self.outer_w_var.set(f"{w:g}"); self.outer_h_var.set(f"{h:g}")
+        self.side_margin_var.set(f"{side:g}"); self.top_margin_var.set(f"{top:g}"); self.bottom_margin_var.set(f"{bottom:g}")
+        self.ratio_var.set(ratio); self._ratio_changed(); self._apply_frame_settings()
+
+    def _ratio_changed(self):
+        if self.ratio_var.get()=="Custom":self.custom_ratio_frame.pack(fill="x",padx=14,pady=(1,3),after=self.ratio_cb)
+        else:self.custom_ratio_frame.pack_forget()
+
+    def _ratio_for(self,path=None):
+        name=self.ratio_var.get()
+        if name in self.RATIOS:return self.RATIOS[name]
+        if name=="Custom":
+            w=self._num(self.custom_ratio_w,4); h=self._num(self.custom_ratio_h,5)
+            return max(.05,w/max(.05,h))
+        if name=="Original" and path:
+            canvas=next((c for p,c in self.canvases if p==path),None)
+            if canvas is not None:return canvas.pil_img.width/max(1,canvas.pil_img.height)
+            try:
+                with Image.open(path) as im:
+                    corrected=ImageOps.exif_transpose(im); return corrected.width/max(1,corrected.height)
+            except Exception:pass
+        return 1.0
+
+    def _frame_values(self,path=None):
+        ow=max(10,self._num(self.outer_w_var,88)); oh=max(10,self._num(self.outer_h_var,107))
+        side=max(0,self._num(self.side_margin_var,4.5)); top=max(0,self._num(self.top_margin_var,5)); bottom=max(0,self._num(self.bottom_margin_var,25))
+        aw=max(1,ow-side*2); ah=max(1,oh-top-bottom); ratio=max(.05,self._ratio_for(path))
+        iw=aw; ih=iw/ratio
+        if ih>ah:ih=ah; iw=ih*ratio
+        x=(ow-iw)/2; y=top
+        return ow,oh,x,y,iw,ih
+
+    def _layout_mode_changed(self):
+        state="disabled" if self.auto_layout_var.get() else "normal"
+        for sp in self.manual_spins:sp.config(state=state)
+        self._schedule_preview()
+
+    def _apply_frame_settings(self):
+        self._rebuild_cards(); self._schedule_preview()
+
+    def _expand_pdf(self,path):
+        result=[]; doc=fitz.open(path)
+        try:
+            for page_no,page in enumerate(doc):
+                saved=None
+                images=page.get_images(full=True)
+                if len(images)==1:
+                    try:
+                        data=doc.extract_image(images[0][0]); ext=data.get("ext","png")
+                        saved=os.path.join(self._temp_dir,f"pdf_{len(self._generated)}_{page_no}.{ext}")
+                        Path(saved).write_bytes(data["image"])
+                    except Exception:saved=None
+                if not saved:
+                    pix=page.get_pixmap(matrix=fitz.Matrix(300/72,300/72),alpha=False)
+                    image=Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
+                    saved=os.path.join(self._temp_dir,f"pdf_{len(self._generated)}_{page_no}.png")
+                    try:image.save(saved,"PNG",compress_level=2)
+                    finally:image.close()
+                self._generated.append(saved); self.display_names[saved]=f"{os.path.basename(path)} — page {page_no+1}"; result.append(saved)
+        finally:doc.close()
+        return result
+
+    def _add_files(self,paths=None):
+        if paths is None:
+            paths=filedialog.askopenfilenames(parent=self,title="Add photos",filetypes=[("Images and PDF","*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp *.heic *.heif *.pdf"),("All files","*.*")])
+        added=[]
+        for path in paths or []:
+            ext=os.path.splitext(path)[1].lower()
+            if ext==".pdf":
+                try:added.extend(self._expand_pdf(path))
+                except Exception as ex:messagebox.showerror("PDF import failed",str(ex),parent=self)
+            elif ext in IMAGE_EXTS:added.append(path); self.display_names.setdefault(path,os.path.basename(path))
+        for path in added:
+            if path not in self.files:self.files.append(path)
+        self._rebuild_cards(); self._schedule_preview()
+
+    def _drop_files(self,paths):self._add_files(paths)
+
+    def _dispose_canvases(self):
+        for _path,canvas in self.canvases:
+            try:canvas.pil_img.close()
+            except Exception:pass
+            try:canvas.tk_img=None; canvas.destroy()
+            except Exception:pass
+        self.canvases.clear()
+
+    def _show_empty(self):
+        for widget in self.cards_frame.winfo_children():widget.destroy()
+        tk.Label(
+            self.cards_frame,
+            text="Drop images here • drag each photo inside its crop frame",
+            bg=BG,fg=MUTED,font=("Segoe UI",10,"bold"),justify="center"
+        ).grid(row=0,column=0,padx=30,pady=55)
+
+    def _rebuild_cards(self):
+        old_state={path:(canvas.get_crop_fractions(),canvas.total_rotation) for path,canvas in self.canvases}
+        self._dispose_canvases()
+        for widget in self.cards_frame.winfo_children():widget.destroy()
+        if not self.files:
+            self._show_empty(); self.count_lbl.config(text="0 images"); return
+        for index,path in enumerate(self.files):
+            card=tk.Frame(
+                self.cards_frame,bg=SURFACE,width=205,height=150,
+                highlightbackground=BORDER,highlightthickness=1
+            )
+            card.grid(row=0,column=index,sticky="ns",padx=(0,7),pady=1)
+            card.grid_propagate(False)
+            top=tk.Frame(card,bg=SURFACE); top.pack(fill="x",padx=6,pady=(5,2))
+            name=self.display_names.get(path,os.path.basename(path))
+            lbl(top,f"{index+1}. {name}",7,TEXT,True).pack(side="left",fill="x",expand=True)
+            tk.Button(
+                top,text="×",command=lambda p=path:self._remove(p),bg=SURFACE2,fg=MUTED,
+                relief="flat",font=("Segoe UI",8,"bold"),cursor="hand2",width=2
+            ).pack(side="right")
+            _ow,_oh,_x,_y,iw,ih=self._frame_values(path)
+            canvas=CropCanvas(card,path,iw,ih,size=(172,105),on_change=self._schedule_preview)
+            canvas.pack(padx=6,pady=(0,3)); self.canvases.append((path,canvas))
+            if path in old_state:
+                fractions,rotation=old_state[path]
+                try:
+                    canvas.set_crop_fractions(fractions)
+                    if rotation:canvas.rotate_manual(rotation)
+                except Exception:pass
+            controls=tk.Frame(card,bg=SURFACE); controls.pack(fill="x",padx=6,pady=(0,4))
+            tk.Button(
+                controls,text="↶ Rotate",command=lambda c=canvas:c.rotate_manual(90),
+                bg=SURFACE2,fg=TEXT,relief="flat",font=("Segoe UI",7),cursor="hand2"
+            ).pack(side="left")
+            lbl(controls,"Drag to position",7,MUTED).pack(side="right")
+        self.cards_frame.update_idletasks()
+        self.cards_canvas.config(scrollregion=self.cards_canvas.bbox("all"))
+        self.count_lbl.config(text=f"{len(self.files)} image(s)")
+
+    def _remove(self,path):
+        if path in self.files:self.files.remove(path)
+        self._rebuild_cards(); self._schedule_preview()
+
+    def _paper_size(self):
+        size=PAPER_SIZES_MM.get(self.sheet_var.get())
+        if not size:return None
+        return float(size[0]),float(size[1])
+
+    def _layout(self):
+        paper=self._paper_size()
+        if not paper:return None
+        ow,oh,*_=self._frame_values(self.files[0] if self.files else None)
+        spacing=max(0,self._num(self.spacing_var,3)); margin=5.0
+        candidates=[]
+        for sw,sh in (paper,(paper[1],paper[0])):
+            for rotated in (False,True):
+                iw,ih=(oh,ow) if rotated else (ow,oh)
+                cols=max(0,int((sw-margin*2+spacing)//(iw+spacing)))
+                rows=max(0,int((sh-margin*2+spacing)//(ih+spacing)))
+                candidates.append((cols*rows,not rotated,sw*sh-(cols*iw+(cols-1)*spacing)*(rows*ih+(rows-1)*spacing),sw,sh,rotated,cols,rows,iw,ih))
+        if self.auto_layout_var.get():
+            best=max(candidates,key=lambda x:(x[0],x[1],x[2]))
+            _cap,_prefer,_waste,sw,sh,rotated,cols,rows,iw,ih=best
+            self.cols_var.set(max(1,cols)); self.rows_var.set(max(1,rows))
+        else:
+            wanted_cols=max(1,int(self.cols_var.get())); wanted_rows=max(1,int(self.rows_var.get()))
+            fitting=[c for c in candidates if c[6]>=wanted_cols and c[7]>=wanted_rows]
+            best=max(fitting,key=lambda x:(x[1],x[2])) if fitting else max(candidates,key=lambda x:x[0])
+            _cap,_prefer,_waste,sw,sh,rotated,_auto_c,_auto_r,iw,ih=best
+            cols,rows=wanted_cols,wanted_rows
+        capacity=max(1,cols*rows)
+        total_w=cols*iw+max(0,cols-1)*spacing; total_h=rows*ih+max(0,rows-1)*spacing
+        ox=(sw-total_w)/2; oy=(sh-total_h)/2
+        fits=total_w<=sw-2 and total_h<=sh-2
+        return dict(sw=sw,sh=sh,rotated=rotated,cols=cols,rows=rows,iw=iw,ih=ih,spacing=spacing,ox=ox,oy=oy,capacity=capacity,fits=fits)
+
+    def _source_image(self,path,canvas,preview):
+        if preview:return canvas.pil_img.copy()
+        with Image.open(path) as opened:
+            corrected=ImageOps.exif_transpose(opened); image=corrected.convert("RGB")
+            if corrected is not opened:
+                try:corrected.close()
+                except Exception:pass
+        if canvas.total_rotation:image=image.rotate(canvas.total_rotation,expand=True)
+        return image
+
+    def _render_item(self,path,canvas,dpi,preview=False):
+        ow,oh,x,y,iw,ih=self._frame_values(path)
+        outer=Image.new("RGB",(max(1,mm_to_px(ow,dpi)),max(1,mm_to_px(oh,dpi))),"white")
+        source=self._source_image(path,canvas,preview)
+        try:
+            l,t,r,b=canvas.get_crop_fractions(); box=(int(l*source.width),int(t*source.height),int(r*source.width),int(b*source.height))
+            cropped=source.crop(box)
+            try:photo=ImageOps.fit(cropped,(max(1,mm_to_px(iw,dpi)),max(1,mm_to_px(ih,dpi))),method=Image.Resampling.BILINEAR if preview else Image.Resampling.LANCZOS,centering=(.5,.5))
+            finally:cropped.close()
+            try:outer.paste(photo,(mm_to_px(x,dpi),mm_to_px(y,dpi)))
+            finally:photo.close()
+        finally:source.close()
+        return outer
+
+    def _draw_cut_marks(self,draw,x,y,w,h,dpi):
+        gap=mm_to_px(1.5,dpi); length=mm_to_px(4,dpi); lw=max(1,mm_to_px(.2,dpi))
+        for cx,dx in ((x,-1),(x+w,1)):
+            for cy,dy in ((y,-1),(y+h,1)):
+                draw.line((cx+dx*gap,cy,cx+dx*(gap+length),cy),fill="black",width=lw)
+                draw.line((cx,cy+dy*gap,cx,cy+dy*(gap+length)),fill="black",width=lw)
+
+    def _draw_outline(self,draw,x,y,w,h,dpi,color="black",stroke_mm=.15):
+        line_width=max(1,mm_to_px(stroke_mm,dpi))
+        draw.rectangle((x,y,x+w-1,y+h-1),outline=color,width=line_width)
+
+    def _build_sheet(self,start,dpi,preview=False):
+        layout=self._layout()
+        if not layout:return None,0,None
+        sheet=Image.new("RGB",(mm_to_px(layout["sw"],dpi),mm_to_px(layout["sh"],dpi)),"white")
+        draw=ImageDraw.Draw(sheet); used=0
+        by=dict(self.canvases)
+        for slot in range(layout["capacity"]):
+            index=start+slot
+            if index>=len(self.files):break
+            path=self.files[index]; canvas=by.get(path)
+            if canvas is None:continue
+            item=self._render_item(path,canvas,dpi,preview)
+            try:
+                if layout["rotated"]:
+                    rotated_item=item.rotate(90,expand=True)
+                    item.close(); item=rotated_item
+                col=slot%layout["cols"]; row=slot//layout["cols"]
+                x=mm_to_px(layout["ox"]+col*(layout["iw"]+layout["spacing"]),dpi)
+                y=mm_to_px(layout["oy"]+row*(layout["ih"]+layout["spacing"]),dpi)
+                sheet.paste(item,(x,y))
+                # Preview-only grey outlines make each white polaroid visible on
+                # the white sheet. They are not exported unless Outline is chosen.
+                if preview:
+                    self._draw_outline(draw,x,y,item.width,item.height,dpi,color="#707080",stroke_mm=.35)
+                    if self.mark_mode_var.get()=="Crop marks":
+                        self._draw_cut_marks(draw,x,y,item.width,item.height,dpi)
+                elif self.mark_mode_var.get()=="Crop marks":
+                    self._draw_cut_marks(draw,x,y,item.width,item.height,dpi)
+                else:
+                    self._draw_outline(draw,x,y,item.width,item.height,dpi,color="black",stroke_mm=.15)
+                used+=1
+            finally:item.close()
+        return sheet,used,layout
+
+    def _schedule_preview(self,*_args):
+        if self._preview_job:
+            try:self.after_cancel(self._preview_job)
+            except Exception:pass
+        self._preview_job=self.after(180,self._draw_preview)
+
+    def _draw_preview(self):
+        self._preview_job=None; self.preview_canvas.delete("all")
+        if not self.files:
+            self.preview_canvas.create_text(max(1,self.preview_canvas.winfo_width())/2,max(1,self.preview_canvas.winfo_height())/2,text="Add photos to preview the first sheet",fill=MUTED,font=("Segoe UI",11,"bold")); self.preview_info.config(text=""); return
+        sheet,used,layout=self._build_sheet(0,45,True)
+        if sheet is None:
+            self.preview_canvas.create_text(190,180,text=f"{self.sheet_var.get()} was not found in the paper-size Excel file.",fill=WARNING,width=330,font=("Segoe UI",9,"bold")); return
+        try:
+            cw=max(80,self.preview_canvas.winfo_width()-18); ch=max(80,self.preview_canvas.winfo_height()-18)
+            scale=min(cw/sheet.width,ch/sheet.height); shown=sheet.resize((max(1,int(sheet.width*scale)),max(1,int(sheet.height*scale))),Image.Resampling.BILINEAR)
+            try:
+                self.preview_photo=ImageTk.PhotoImage(shown); self.preview_canvas.create_image(self.preview_canvas.winfo_width()/2,self.preview_canvas.winfo_height()/2,image=self.preview_photo,anchor="center")
+            finally:shown.close()
+        finally:sheet.close()
+        pages=math.ceil(len(self.files)/layout["capacity"]); self.preview_info.config(text=f"{layout['cols']} × {layout['rows']} • {pages} sheet(s)")
+        self.status.config(text=(f"{used} per sheet • {'rotated automatically' if layout['rotated'] else 'upright'}" if layout["fits"] else "Manual layout does not fit the selected sheet."),fg=SUCCESS if layout["fits"] else WARNING)
+
+    def _export_pdf(self):
+        if not self.files:messagebox.showwarning("Nothing to export","Add at least one photo first.",parent=self); return
+        layout=self._layout()
+        if not layout:messagebox.showerror("Paper size missing",f"{self.sheet_var.get()} is missing from the paper-size Excel file.",parent=self); return
+        if not layout["fits"]:messagebox.showwarning("Layout does not fit","Reduce rows, columns, spacing, or frame size.",parent=self); return
+        out=filedialog.asksaveasfilename(parent=self,title="Export polaroid sheets",defaultextension=".pdf",filetypes=[("PDF","*.pdf")],initialfile=f"polaroids_{self.sheet_var.get()}.pdf")
+        if not out:return
+        self.export_btn.config(state="disabled"); self.status.config(text="Exporting print-ready PDF…",fg=MUTED); self.update_idletasks()
+        pdf=fitz.open(); start=0
+        try:
+            while start<len(self.files):
+                sheet,used,current=self._build_sheet(start,300,False)
+                if sheet is None or used<=0:break
+                buffer=io.BytesIO()
+                try:
+                    sheet.save(buffer,"PNG",compress_level=2)
+                    page=pdf.new_page(width=current["sw"]*72/25.4,height=current["sh"]*72/25.4)
+                    page.insert_image(page.rect,stream=buffer.getvalue())
+                finally:buffer.close(); sheet.close()
+                start+=used; gc.collect(0)
+            pdf.save(out,garbage=3,deflate=True)
+            self.status.config(text=f"Exported {math.ceil(len(self.files)/layout['capacity'])} sheet(s).",fg=SUCCESS)
+            messagebox.showinfo("Done",f"Polaroid PDF exported to:\n{out}",parent=self)
+        except Exception as ex:messagebox.showerror("Export failed",str(ex),parent=self)
+        finally:pdf.close(); self.export_btn.config(state="normal")
+
+    def _clear(self):
+        self._dispose_canvases(); self.files.clear(); self.display_names.clear(); self.preview_photo=None
+        for path in self._generated:
+            try:os.remove(path)
+            except Exception:pass
+        self._generated.clear(); self._show_empty(); self.count_lbl.config(text="0 images"); self.preview_canvas.delete("all"); self.status.config(text="Add images or a PDF.",fg=MUTED); gc.collect()
+
+# ── Scan Cropping Tab ────────────────────────────────────────────────────────
+class ScanCroppingTab(tk.Frame,DropMixin):
+    """Detect separate photographs on white scanned PDF pages."""
+    def __init__(self,parent):
+        super().__init__(parent,bg=BG)
+        self.pages=[]; self.current_page=-1; self.selected_crop=-1
+        self.canvas_photo=None; self._drag_corner=None; self._busy=False
+        self._worker_results=queue.Queue(); self._scan_generation=0
+        self._poll_job=None
+        self._build(); self._poll_job=self.after(80,self._poll_worker_results)
+
+    def _build(self):
+        self.grid_rowconfigure(0,weight=1); self.grid_columnconfigure(1,weight=1)
+        left=tk.Frame(self,bg=SURFACE,width=270); left.grid(row=0,column=0,sticky="nsew"); left.grid_propagate(False)
+        lbl(left,"SCAN CROPPING",9,MUTED,True).pack(anchor="w",padx=14,pady=(12,4))
+        tk.Label(left,text="Detect photos separated by gaps on a white scanner background.",bg=SURFACE,fg=MUTED,font=("Segoe UI",8),wraplength=235,justify="left").pack(anchor="w",padx=14,pady=(0,8))
+        row=tk.Frame(left,bg=SURFACE); row.pack(fill="x",padx=14)
+        styled_btn(row,"Add scanned PDFs",self._add_files).pack(side="left",fill="x",expand=True)
+        styled_btn(row,"Clear",self._clear,style="secondary").pack(side="left",padx=(6,0))
+        sep(left)
+        self.sensitivity_var=tk.IntVar(value=22)
+        self.sensitivity_lbl=lbl(left,"Detection sensitivity: 22",8); self.sensitivity_lbl.pack(anchor="w",padx=14)
+        ttk.Scale(left,from_=5,to=70,variable=self.sensitivity_var,orient="horizontal",command=lambda v:self.sensitivity_lbl.config(text=f"Detection sensitivity: {int(float(v))}")).pack(fill="x",padx=14)
+        minrow=tk.Frame(left,bg=SURFACE); minrow.pack(fill="x",padx=14,pady=(7,2))
+        lbl(minrow,"Minimum photo area (%)",8).pack(side="left")
+        self.min_area_var=tk.DoubleVar(value=3.0); entry(minrow,self.min_area_var,6).pack(side="right")
+        self.straighten_var=tk.BooleanVar(value=True)
+        tk.Checkbutton(left,text="Straighten detected photos",variable=self.straighten_var,bg=SURFACE,fg=TEXT,selectcolor=SURFACE2,activebackground=SURFACE,font=("Segoe UI",9)).pack(anchor="w",padx=14,pady=4)
+        styled_btn(left,"Detect current page",self._detect_current,style="success").pack(fill="x",padx=14,pady=(5,2))
+        controls=tk.Frame(left,bg=SURFACE); controls.pack(fill="x",padx=14,pady=2)
+        styled_btn(controls,"Add manual crop",self._add_manual_crop,style="secondary").pack(side="left",fill="x",expand=True)
+        styled_btn(controls,"Delete crop",self._delete_crop,style="secondary").pack(side="left",fill="x",expand=True,padx=(5,0))
+        sep(left); lbl(left,"PAGES",8,MUTED,True).pack(anchor="w",padx=14)
+        self.page_list=tk.Listbox(left,bg=SURFACE2,fg=TEXT,selectbackground=ACCENT,selectforeground="white",relief="flat",font=("Segoe UI",8),highlightthickness=0)
+        self.page_list.pack(fill="both",expand=True,padx=14,pady=(4,6)); self.page_list.bind("<<ListboxSelect>>",self._page_selected)
+        self.status=lbl(left,"Add one or more scanned PDF files.",8,MUTED); self.status.pack(fill="x",padx=14,pady=(0,5))
+        self.export_btn=styled_btn(left,"Export cropped photos to one PDF",self._export_pdf,style="success"); self.export_btn.pack(fill="x",padx=14,pady=(0,12))
+
+        center=tk.Frame(self,bg=BG); center.grid(row=0,column=1,sticky="nsew",padx=8,pady=8); center.grid_rowconfigure(1,weight=1); center.grid_columnconfigure(0,weight=1)
+        head=tk.Frame(center,bg=BG); head.grid(row=0,column=0,sticky="ew",pady=(0,5))
+        lbl(head,"SCAN PREVIEW",9,MUTED,True).pack(side="left")
+        self.crop_count_lbl=lbl(head,"0 detected",8,MUTED); self.crop_count_lbl.pack(side="right")
+        self.canvas=tk.Canvas(center,bg=SURFACE,highlightbackground=BORDER,highlightthickness=1,cursor="crosshair")
+        self.canvas.grid(row=1,column=0,sticky="nsew")
+        self.canvas.bind("<Configure>",lambda e:self._draw_page())
+        self.canvas.bind("<ButtonPress-1>",self._canvas_press)
+        self.canvas.bind("<B1-Motion>",self._canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>",lambda e:setattr(self,"_drag_corner",None))
+        self.setup_drop_everywhere(self,self._drop_files,{".pdf"})
+
+    def _poll_worker_results(self):
+        try:
+            while True:
+                kind,payload=self._worker_results.get_nowait()
+                if kind=="detect_done":
+                    generation,results=payload
+                    if generation==self._scan_generation:self._apply_detection(results)
+                elif kind=="detect_error":
+                    generation,error=payload
+                    if generation==self._scan_generation:self._detection_error(error)
+                elif kind=="export_done":
+                    path,count=payload; self._export_done(path,count)
+                elif kind=="export_error":
+                    self._detection_error(payload)
+        except queue.Empty:
+            pass
+        try:self._poll_job=self.after(80,self._poll_worker_results)
+        except Exception:self._poll_job=None
+
+    def _add_files(self):
+        self._drop_files(list(filedialog.askopenfilenames(parent=self,title="Add scanned PDFs",filetypes=[("PDF files","*.pdf")])))
+
+    def _drop_files(self,paths):
+        self._scan_generation+=1
+        added=0
+        for path in paths:
+            if os.path.splitext(path)[1].lower()!=".pdf":continue
+            try:
+                doc=fitz.open(path)
+                try:
+                    for page_no in range(len(doc)):
+                        if any(p["source"]==path and p["page_no"]==page_no for p in self.pages):continue
+                        pix=doc[page_no].get_pixmap(matrix=fitz.Matrix(100/72,100/72),alpha=False)
+                        preview=Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
+                        preview.thumbnail((1500,1500),Image.Resampling.BILINEAR)
+                        self.pages.append({"source":path,"page_no":page_no,"preview":preview,"crops":[]}); added+=1
+                finally:doc.close()
+            except Exception as ex:messagebox.showerror("PDF import failed",f"{os.path.basename(path)}\n{ex}",parent=self)
+        if added:
+            self._refresh_page_list(); self._select_page(0 if self.current_page<0 else self.current_page)
+            self.status.config(text=f"Loaded {len(self.pages)} page(s). Detecting photos…",fg=MUTED); self._detect_all_async()
+
+    def _refresh_page_list(self):
+        self.page_list.delete(0,"end")
+        for i,page in enumerate(self.pages):
+            self.page_list.insert("end",f"{i+1}. {os.path.basename(page['source'])} — page {page['page_no']+1} ({len(page['crops'])})")
+
+    def _select_page(self,index):
+        if not self.pages:return
+        self.current_page=max(0,min(index,len(self.pages)-1)); self.selected_crop=0 if self.pages[self.current_page]["crops"] else -1
+        self.page_list.selection_clear(0,"end"); self.page_list.selection_set(self.current_page); self.page_list.see(self.current_page); self._draw_page()
+
+    def _page_selected(self,_event=None):
+        selected=self.page_list.curselection()
+        if selected:self._select_page(selected[0])
+
+    @staticmethod
+    def _order_points(points):
+        pts=np.asarray(points,dtype=np.float32); sums=pts.sum(axis=1); diffs=np.diff(pts,axis=1).ravel()
+        return np.array([pts[np.argmin(sums)],pts[np.argmin(diffs)],pts[np.argmax(sums)],pts[np.argmax(diffs)]],dtype=np.float32)
+
+    def _detect_image(self,image,sensitivity=None,min_area_percent=None):
+        rgb=np.array(image.convert("RGB")); gray=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
+        threshold=max(5,min(70,int(self.sensitivity_var.get() if sensitivity is None else sensitivity)))
+        mask=np.where(gray<255-threshold,255,0).astype(np.uint8)
+        size=max(3,int(min(mask.shape[:2])*.006)); size+=1-size%2
+        kernel=cv2.getStructuringElement(cv2.MORPH_RECT,(size,size))
+        mask=cv2.morphologyEx(mask,cv2.MORPH_CLOSE,kernel,iterations=2)
+        contours,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        area_percent=float(self.min_area_var.get() if min_area_percent is None else min_area_percent)
+        min_area=max(.001,area_percent/100)*image.width*image.height
+        crops=[]
+        for contour in contours:
+            if cv2.contourArea(contour)<min_area:continue
+            rect=cv2.minAreaRect(contour); (_cx,_cy),(w,h),_angle=rect
+            if min(w,h)<35:continue
+            box=self._order_points(cv2.boxPoints(rect)); centre=box.mean(axis=0); box=centre+(box-centre)*0.992
+            box[:,0]=np.clip(box[:,0],0,image.width-1); box[:,1]=np.clip(box[:,1],0,image.height-1)
+            crops.append([(float(x/image.width),float(y/image.height)) for x,y in box])
+        crops.sort(key=lambda points:(sum(y for _x,y in points)/4,sum(x for x,_y in points)/4))
+        return crops
+
+    def _detect_all_async(self):
+        if self._busy:return
+        self._busy=True; self.export_btn.config(state="disabled")
+        previews=[p["preview"].copy() for p in self.pages]
+        sensitivity=int(self.sensitivity_var.get()); min_area=float(self.min_area_var.get())
+        generation=self._scan_generation
+        def work():
+            results=[]
+            try:
+                for image in previews:
+                    try:results.append(self._detect_image(image,sensitivity,min_area))
+                    finally:image.close()
+                self._worker_results.put(("detect_done",(generation,results)))
+            except Exception as ex:
+                for image in previews:
+                    try:image.close()
+                    except Exception:pass
+                self._worker_results.put(("detect_error",(generation,str(ex))))
+        threading.Thread(target=work,daemon=True).start()
+
+    def _apply_detection(self,results):
+        for page,crops in zip(self.pages,results):page["crops"]=crops
+        self._busy=False; self.export_btn.config(state="normal"); self._refresh_page_list(); self._select_page(max(0,self.current_page))
+        total=sum(len(p["crops"]) for p in self.pages); self.status.config(text=f"Detected {total} photo(s). Drag blue corner handles to adjust.",fg=SUCCESS)
+
+    def _detection_error(self,error):
+        self._busy=False; self.export_btn.config(state="normal"); messagebox.showerror("Detection failed",str(error),parent=self)
+
+    def _detect_current(self):
+        if self.current_page<0:return
+        page=self.pages[self.current_page]
+        try:page["crops"]=self._detect_image(page["preview"]); self.selected_crop=0 if page["crops"] else -1; self._refresh_page_list(); self._draw_page()
+        except Exception as ex:messagebox.showerror("Detection failed",str(ex),parent=self)
+
+    def _geometry(self):
+        if self.current_page<0 or not self.pages:return None
+        image=self.pages[self.current_page]["preview"]; cw=max(1,self.canvas.winfo_width()); ch=max(1,self.canvas.winfo_height())
+        scale=min((cw-24)/image.width,(ch-24)/image.height); dw=max(1,int(image.width*scale)); dh=max(1,int(image.height*scale)); ox=(cw-dw)//2; oy=(ch-dh)//2
+        return image,ox,oy,dw,dh
+
+    def _draw_page(self):
+        self.canvas.delete("all"); geometry=self._geometry()
+        if not geometry:
+            self.canvas.create_text(max(1,self.canvas.winfo_width())/2,max(1,self.canvas.winfo_height())/2,text="Drop scanned PDF files here",fill=MUTED,font=("Segoe UI",13,"bold")); return
+        image,ox,oy,dw,dh=geometry; resized=image.resize((dw,dh),Image.Resampling.BILINEAR)
+        old_photo=self.canvas_photo
+        try:self.canvas_photo=ImageTk.PhotoImage(resized)
+        finally:resized.close()
+        if old_photo is not None:
+            try:old_photo.__del__()
+            except Exception:pass
+        self.canvas.create_image(ox,oy,anchor="nw",image=self.canvas_photo)
+        crops=self.pages[self.current_page]["crops"]
+        for index,points in enumerate(crops):
+            flat=[]
+            for x,y in points:flat.extend((ox+x*dw,oy+y*dh))
+            colour=ACCENT if index==self.selected_crop else SUCCESS
+            self.canvas.create_polygon(*flat,outline=colour,fill="",width=3 if index==self.selected_crop else 2)
+            self.canvas.create_text(sum(flat[0::2])/4,sum(flat[1::2])/4,text=str(index+1),fill="white",font=("Segoe UI",10,"bold"))
+            if index==self.selected_crop:
+                for corner in range(4):
+                    x,y=flat[corner*2],flat[corner*2+1]; self.canvas.create_oval(x-7,y-7,x+7,y+7,fill=ACCENT,outline="white")
+        self.crop_count_lbl.config(text=f"{len(crops)} detected")
+
+    def _canvas_press(self,event):
+        geometry=self._geometry()
+        if not geometry:return
+        _image,ox,oy,dw,dh=geometry; page=self.pages[self.current_page]; nearest=None
+        for index,points in enumerate(page["crops"]):
+            for corner,(nx,ny) in enumerate(points):
+                dist=(event.x-(ox+nx*dw))**2+(event.y-(oy+ny*dh))**2
+                if dist<=18**2 and (nearest is None or dist<nearest[0]):nearest=(dist,index,corner)
+        if nearest:
+            self.selected_crop=nearest[1]; self._drag_corner=nearest[2]; self._draw_page(); return
+        for index,points in enumerate(page["crops"]):
+            polygon=np.array([(ox+x*dw,oy+y*dh) for x,y in points],np.float32)
+            if cv2.pointPolygonTest(polygon,(event.x,event.y),False)>=0:self.selected_crop=index; self._draw_page(); return
+
+    def _canvas_drag(self,event):
+        if self._drag_corner is None or self.selected_crop<0:return
+        geometry=self._geometry()
+        if not geometry:return
+        _image,ox,oy,dw,dh=geometry
+        nx=max(0,min(1,(event.x-ox)/max(1,dw))); ny=max(0,min(1,(event.y-oy)/max(1,dh)))
+        self.pages[self.current_page]["crops"][self.selected_crop][self._drag_corner]=(nx,ny); self._draw_page()
+
+    def _add_manual_crop(self):
+        if self.current_page<0:return
+        self.pages[self.current_page]["crops"].append([(0.15,0.15),(0.85,0.15),(0.85,0.85),(0.15,0.85)])
+        self.selected_crop=len(self.pages[self.current_page]["crops"])-1; self._refresh_page_list(); self._draw_page()
+
+    def _delete_crop(self):
+        if self.current_page<0 or self.selected_crop<0:return
+        crops=self.pages[self.current_page]["crops"]
+        if self.selected_crop<len(crops):crops.pop(self.selected_crop)
+        self.selected_crop=min(self.selected_crop,len(crops)-1); self._refresh_page_list(); self._draw_page()
+
+    @staticmethod
+    def _native_dpi(page):
+        dpi=300
+        try:
+            for info in page.get_image_info(xrefs=True):
+                bbox=fitz.Rect(info.get("bbox")); coverage=(bbox.width*bbox.height)/(page.rect.width*page.rect.height)
+                if coverage>.85:
+                    dpi=max(dpi,int(max(info.get("width",0)/(page.rect.width/72),info.get("height",0)/(page.rect.height/72))))
+        except Exception:pass
+        return max(150,min(1200,dpi))
+
+    def _crop_photo(self,image,points,straighten):
+        array=image if isinstance(image,np.ndarray) else np.array(image.convert("RGB"))
+        h,w=array.shape[:2]; pts=self._order_points([(x*w,y*h) for x,y in points])
+        if not straighten:
+            x1=max(0,int(np.floor(pts[:,0].min()))); y1=max(0,int(np.floor(pts[:,1].min()))); x2=min(w,int(np.ceil(pts[:,0].max()))); y2=min(h,int(np.ceil(pts[:,1].max())))
+            return Image.fromarray(array[y1:y2,x1:x2].copy())
+        tl,tr,br,bl=pts; out_w=max(1,int(round(max(np.linalg.norm(br-bl),np.linalg.norm(tr-tl))))); out_h=max(1,int(round(max(np.linalg.norm(tr-br),np.linalg.norm(tl-bl)))))
+        target=np.array([[0,0],[out_w-1,0],[out_w-1,out_h-1],[0,out_h-1]],np.float32)
+        matrix=cv2.getPerspectiveTransform(pts,target)
+        return Image.fromarray(cv2.warpPerspective(array,matrix,(out_w,out_h),flags=cv2.INTER_LANCZOS4,borderMode=cv2.BORDER_REPLICATE))
+
+    def _export_pdf(self):
+        total=sum(len(p["crops"]) for p in self.pages)
+        if not total:messagebox.showwarning("Nothing to export","Detect or add at least one crop first.",parent=self); return
+        out=filedialog.asksaveasfilename(parent=self,title="Export cropped photos",defaultextension=".pdf",filetypes=[("PDF","*.pdf")],initialfile="scanned_photos.pdf")
+        if not out:return
+        snapshot=[(p["source"],p["page_no"],[list(c) for c in p["crops"]]) for p in self.pages]; straighten=self.straighten_var.get()
+        self.export_btn.config(state="disabled"); self.status.config(text="Exporting full-resolution photos…",fg=MUTED)
+        def work():
+            pdf=fitz.open(); count=0
+            try:
+                for source,page_no,crops in snapshot:
+                    doc=fitz.open(source)
+                    try:
+                        page=doc[page_no]; dpi=self._native_dpi(page); pix=page.get_pixmap(matrix=fitz.Matrix(dpi/72,dpi/72),alpha=False); full=Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
+                    finally:doc.close()
+                    full_array=np.array(full); full.close()
+                    try:
+                        for points in crops:
+                            photo=self._crop_photo(full_array,points,straighten); buffer=io.BytesIO()
+                            try:
+                                photo.save(buffer,"PNG",compress_level=3); output_page=pdf.new_page(width=photo.width*72/dpi,height=photo.height*72/dpi); output_page.insert_image(output_page.rect,stream=buffer.getvalue()); count+=1
+                            finally:buffer.close(); photo.close()
+                    finally:
+                        del full_array
+                    gc.collect(0)
+                pdf.save(out,garbage=3,deflate=True); self._worker_results.put(("export_done",(out,count)))
+            except Exception as ex:self._worker_results.put(("export_error",str(ex)))
+            finally:pdf.close()
+        threading.Thread(target=work,daemon=True).start()
+
+    def _export_done(self,path,count):
+        self.export_btn.config(state="normal"); self.status.config(text=f"Exported {count} photo(s).",fg=SUCCESS); messagebox.showinfo("Done",f"Exported {count} cropped photo(s) to:\n{path}",parent=self)
+
+    def _clear(self):
+        self._scan_generation+=1; self._busy=False
+        try:self.export_btn.config(state="normal")
+        except Exception:pass
+        for page in self.pages:
+            try:page["preview"].close()
+            except Exception:pass
+        self.pages.clear(); self.current_page=-1; self.selected_crop=-1; self.canvas_photo=None; self.page_list.delete(0,"end"); self.crop_count_lbl.config(text="0 detected"); self.status.config(text="Add one or more scanned PDF files.",fg=MUTED); self._draw_page(); gc.collect()
+
+    def clear_memory_cache(self):
+        self.canvas_photo=None; self._draw_page(); gc.collect()
+
+    def destroy(self):
+        try:
+            refresh=getattr(self,"_copypro_drop_refresh_job",None)
+            if refresh:self.after_cancel(refresh)
+            if self._poll_job:self.after_cancel(self._poll_job)
+        except Exception:pass
+        self._poll_job=None; self._clear(); super().destroy()
 
 
 # ── Print Counter Tab ────────────────────────────────────────────────────────
@@ -3316,761 +4340,15 @@ def _build_plu_table():
 
 PLU_TABLE = _build_plu_table()
 
-# Unit prices in EUR, keyed by the final/resolved PLU code.
-# These values were transcribed from the supplied store price sheets.
-PLU_PRICES = {
-    # Black-and-white copying / printing
-    "10": 0.15, "11": 0.10, "12": 0.08, "13": 0.07,
-    "20": 0.25, "21": 0.20, "22": 0.15, "23": 0.12,
-    "30": 0.30, "31": 0.25, "32": 0.20, "33": 0.15,
-    "40": 0.50, "41": 0.45, "42": 0.40, "43": 0.25,
-    "50": 0.30, "51": 0.50, "52": 0.40, "53": 0.60,
-    "60": 0.20,
-    "110": 0.15, "111": 0.10, "112": 0.08, "113": 0.07,
-    "120": 0.25, "121": 0.20, "122": 0.15, "123": 0.12,
-    "130": 0.30, "131": 0.25, "132": 0.20, "133": 0.15,
-    "140": 0.50, "141": 0.45, "142": 0.40, "143": 0.25,
-    "310": 0.15, "311": 0.10, "312": 0.08, "313": 0.07,
-    "320": 0.25, "321": 0.20, "322": 0.15, "323": 0.12,
-    "330": 0.30, "331": 0.25, "332": 0.20, "333": 0.15,
-    "340": 0.50, "341": 0.45, "342": 0.40, "343": 0.25,
-    "450": 0.50, "451": 0.80, "650": 0.50, "651": 0.80,
-
-    # Colour printing
-    "510": 0.95, "511": 0.85, "512": 0.75, "513": 0.65,
-    "520": 1.65, "521": 1.50, "522": 1.30, "523": 1.10,
-    "530": 1.60, "531": 1.50, "532": 1.35, "533": 1.20,
-    "540": 2.90, "541": 2.75, "542": 2.50, "543": 2.00,
-    "710": 0.95, "711": 0.85, "712": 0.75, "713": 0.65,
-    "720": 1.65, "721": 1.50, "722": 1.30, "723": 1.10,
-    "730": 1.60, "731": 1.50, "732": 1.35, "733": 1.20,
-    "740": 2.90, "741": 2.75, "742": 2.50, "743": 2.00,
-
-    # Paper and speciality products
-    "899": 2.00, "954": 0.70, "956": 0.80, "966": 3.50,
-    "988": 1.00, "999": 2.00,
-    "1090": 2.50, "1092": 2.50, "1095": 3.50, "1096": 3.20,
-    "1184": 7.50, "1319": 2.00,
-    "2022": 3.00, "2851": 3.10,
-    "9502": 0.15, "9504": 5.50, "9512": 0.20,
-    "9582": 1.00, "9592": 1.50,
-    "9822": 0.50, "9832": 0.80, "9842": 0.65, "9852": 0.95,
-    "9862": 1.10, "9872": 2.10, "9922": 1.50,
-    "9972": 0.40, "9982": 0.60,
-
-    # Photo printing
-    "1999": 0.60, "1999x2": 1.20, "2000": 2.50, "2001": 5.00,
-
-    # Other visible product codes
-    "4820": 1.60, "4840": 2.10, "4860": 2.55, "4893": 3.20,
-    "4900": 3.30, "4903": 3.30, "4909": 3.20,
-    "4914": 2.30, "4915": 2.80,
-}
-
-
-# Descriptions keyed by the final/resolved PLU code.
-PLU_DESCRIPTIONS = {
-    # Black-and-white copying
-    "10": "A4 B&W copy, one-sided, 1–100",
-    "11": "A4 B&W copy, one-sided, 101–500",
-    "12": "A4 B&W copy, one-sided, 501–1000",
-    "13": "A4 B&W copy, one-sided, 1001+",
-    "20": "A4 B&W copy, double-sided, 1–100",
-    "21": "A4 B&W copy, double-sided, 101–500",
-    "22": "A4 B&W copy, double-sided, 501–1000",
-    "23": "A4 B&W copy, double-sided, 1001+",
-    "30": "A3 B&W copy, one-sided, 1–100",
-    "31": "A3 B&W copy, one-sided, 101–500",
-    "32": "A3 B&W copy, one-sided, 501–1000",
-    "33": "A3 B&W copy, one-sided, 1001+",
-    "40": "A3 B&W copy, double-sided, 1–100",
-    "41": "A3 B&W copy, double-sided, 101–500",
-    "42": "A3 B&W copy, double-sided, 501–1000",
-    "43": "A3 B&W copy, double-sided, 1001+",
-    "50": "A4 B&W copy from glass, one-sided",
-    "51": "A4 B&W copy from glass, double-sided",
-    "52": "A3 B&W copy from glass, one-sided",
-    "53": "A3 B&W copy from glass, double-sided",
-    "60": "Reduction / enlargement",
-
-    # Black-and-white printing
-    "110": "A4 B&W print, one-sided, 1–100",
-    "111": "A4 B&W print, one-sided, 101–500",
-    "112": "A4 B&W print, one-sided, 501–1000",
-    "113": "A4 B&W print, one-sided, 1001+",
-    "120": "A4 B&W print, double-sided, 1–100",
-    "121": "A4 B&W print, double-sided, 101–500",
-    "122": "A4 B&W print, double-sided, 501–1000",
-    "123": "A4 B&W print, double-sided, 1001+",
-    "130": "A3 B&W print, one-sided, 1–100",
-    "131": "A3 B&W print, one-sided, 101–500",
-    "132": "A3 B&W print, one-sided, 501–1000",
-    "133": "A3 B&W print, one-sided, 1001+",
-    "140": "A3 B&W print, double-sided, 1–100",
-    "141": "A3 B&W print, double-sided, 101–500",
-    "142": "A3 B&W print, double-sided, 501–1000",
-    "143": "A3 B&W print, double-sided, 1001+",
-
-    # INEO B&W printing
-    "310": "A4 B&W INEO print, one-sided, 1–100",
-    "311": "A4 B&W INEO print, one-sided, 101–500",
-    "312": "A4 B&W INEO print, one-sided, 501–1000",
-    "313": "A4 B&W INEO print, one-sided, 1001+",
-    "320": "A4 B&W INEO print, double-sided, 1–100",
-    "321": "A4 B&W INEO print, double-sided, 101–500",
-    "322": "A4 B&W INEO print, double-sided, 501–1000",
-    "323": "A4 B&W INEO print, double-sided, 1001+",
-    "330": "A3 B&W INEO print, one-sided, 1–100",
-    "331": "A3 B&W INEO print, one-sided, 101–500",
-    "332": "A3 B&W INEO print, one-sided, 501–1000",
-    "333": "A3 B&W INEO print, one-sided, 1001+",
-    "340": "A3 B&W INEO print, double-sided, 1–100",
-    "341": "A3 B&W INEO print, double-sided, 101–500",
-    "342": "A3 B&W INEO print, double-sided, 501–1000",
-    "343": "A3 B&W INEO print, double-sided, 1001+",
-
-    "450": "A4 B&W print on 90 gsm paper",
-    "451": "A3 B&W print on 90 gsm paper",
-    "650": "A4 B&W print on other paper",
-    "651": "A3 B&W print on other paper",
-
-    # Colour printing on 90 gsm paper
-    "510": "A4 colour print, one-sided, 1–10",
-    "511": "A4 colour print, one-sided, 11–50",
-    "512": "A4 colour print, one-sided, 51–100",
-    "513": "A4 colour print, one-sided, 101–500",
-    "520": "A4 colour print, double-sided, 1–10",
-    "521": "A4 colour print, double-sided, 11–50",
-    "522": "A4 colour print, double-sided, 51–100",
-    "523": "A4 colour print, double-sided, 101–500",
-    "530": "A3 colour print, one-sided, 1–10",
-    "531": "A3 colour print, one-sided, 11–50",
-    "532": "A3 colour print, one-sided, 51–100",
-    "533": "A3 colour print, one-sided, 101–500",
-    "540": "A3 colour print, double-sided, 1–10",
-    "541": "A3 colour print, double-sided, 11–50",
-    "542": "A3 colour print, double-sided, 51–100",
-    "543": "A3 colour print, double-sided, 101–500",
-
-    # Colour printing on other paper
-    "710": "A4 colour print on other paper, one-sided, 1–10",
-    "711": "A4 colour print on other paper, one-sided, 11–50",
-    "712": "A4 colour print on other paper, one-sided, 51–100",
-    "713": "A4 colour print on other paper, one-sided, 101–500",
-    "720": "A4 colour print on other paper, double-sided, 1–10",
-    "721": "A4 colour print on other paper, double-sided, 11–50",
-    "722": "A4 colour print on other paper, double-sided, 51–100",
-    "723": "A4 colour print on other paper, double-sided, 101–500",
-    "730": "A3 colour print on other paper, one-sided, 1–10",
-    "731": "A3 colour print on other paper, one-sided, 11–50",
-    "732": "A3 colour print on other paper, one-sided, 51–100",
-    "733": "A3 colour print on other paper, one-sided, 101–500",
-    "740": "A3 colour print on other paper, double-sided, 1–10",
-    "741": "A3 colour print on other paper, double-sided, 11–50",
-    "742": "A3 colour print on other paper, double-sided, 51–100",
-    "743": "A3 colour print on other paper, double-sided, 101–500",
-
-    # Paper and speciality products
-    "899": "A4 decorative paper",
-    "954": "80 gsm coloured A4 paper",
-    "956": "160 gsm coloured A4 paper",
-    "966": "SRA3 adhesive sheet",
-    "988": "135–250 gsm A4 photo paper",
-    "999": "A4 transparency",
-    "1090": "350–400 gsm A3/SRA3 photo paper",
-    "1092": "Textured A3/SRA3 paper",
-    "1095": "Long-lasting tear-resistant A3 paper",
-    "1096": "Magnetic SRA3 paper",
-    "1184": "Pioneer Navigator A4 paper pack",
-    "1319": "A4 Curious Collection paper",
-    "2022": "A3 transparency",
-    "2851": "SRA3 transfer paper, 350 gsm",
-    "9502": "80 gsm A4 paper",
-    "9504": "80 gsm paper pack",
-    "9512": "80 gsm A3 paper",
-    "9582": "A4 transfer paper",
-    "9592": "A3 transfer paper",
-    "9822": "160 gsm A4 paper",
-    "9832": "160 gsm A3 paper",
-    "9842": "200 gsm A4 paper",
-    "9852": "200 gsm A3 paper",
-    "9862": "250–300 gsm A4 paper",
-    "9872": "250–300 gsm A3 paper",
-    "9922": "A4 adhesive paper",
-    "9972": "120 gsm A4 paper",
-    "9982": "120 gsm A3 paper",
-
-    # Photo printing
-    "1999": "10 × 15 photo print",
-    "1999x2": "A5 photo print",
-    "2000": "A4 photo print",
-    "2001": "Document photo",
-
-    # Other visible codes; product names were not visible in the supplied photo
-    "4820": "Other product", "4840": "Other product", "4860": "Other product",
-    "4893": "Other product", "4900": "Other product", "4903": "Other product",
-    "4909": "Other product", "4914": "Other product", "4915": "Other product",
-}
-
-
-# Additional confirmed store products. Existing entries above remain authoritative
-# when the same PLU appeared on more than one price sheet.
-PLU_PRICES.update({
-    "70":0.13,"71":0.13,"72":0.25,"73":0.25,"74":0.25,"75":0.25,"76":0.45,"77":0.45,
-    "151":0.30,"153":0.40,"156":0.30,"160":2.00,"161":2.00,"162":3.00,"163":3.00,"172":1.00,
-    "396":3.50,"397":3.50,"398":2.00,"399":1.50,"470":0.65,"471":0.65,"472":1.30,"473":1.30,
-    "474":1.30,"475":1.30,"476":2.60,"477":2.60,"496":6.50,"497":6.50,"498":3.50,"499":2.00,
-    "500":7.00,"561":0.80,"563":1.10,
-    "751":8.00,"753":8.50,"754":8.60,"755":8.90,"756":8.90,"757":9.00,"758":9.40,"759":9.80,"760":10.20,
-    "767":4.50,"768":5.20,"769":4.50,"770":4.90,"771":5.20,"772":5.50,"773":6.00,"774":6.20,"775":6.50,"776":6.80,
-    "791":3.00,"796":5.50,
-    "800":0.50,"801":0.60,"802":0.70,"803":0.80,"804":0.90,"805":1.00,"806":1.50,"807":2.20,"808":2.70,"809":3.20,
-    "810":0.50,"811":0.60,"812":0.70,"820":0.50,"821":0.60,"822":0.70,"824":0.90,"825":1.00,"827":2.00,"828":2.50,"829":3.20,
-    "830":0.25,"831":0.30,"832":0.35,"840":0.25,"841":0.30,"842":0.30,"850":3.20,
-    "880":3.00,"881":3.50,"882":4.50,"883":5.50,"884":6.00,"891":1.20,"892":1.20,"893":1.20,"894":2.00,"895":1.20,"896":2.00,
-    "900":1.00,"901":1.00,"903":1.20,"904":1.20,"905":2.00,"906":2.50,"907":3.50,"908":3.50,"910":2.80,"914":1.50,"918":4.20,
-    "920":0.25,"921":0.60,"922":0.80,"924":0.60,"926":0.80,"927":1.50,"928":2.00,"929":2.50,"930":1.00,
-    "933":0.10,"934":0.50,"935":1.00,"936":0.50,"941":0.50,"942":1.20,
-    "1001":6.50,"1002":1.20,"1003":1.00,"1004":1.30,"1006":0.20,"1007":1.50,"1009":2.00,
-    "1011":6.00,"1012":7.00,"1015":0.50,"1016":2.50,"1019":1.00,"1020":0.70,"1021":0.60,"1025":8.00,
-    "1033":6.50,"1042":3.00,"1044":4.50,"1062":0.50,"1066":1.20,"1067":1.50,"1068":1.40,"1069":1.80,
-    "1070":1.70,"1071":2.70,"1072":2.70,"1073":3.70,"1074":3.60,"1075":5.00,"1076":5.20,"1077":5.00,"1079":7.00,
-    "1081":0.70,"1082":1.00,"1083":0.90,"1084":1.30,"1085":0.90,"1086":1.50,"1087":1.60,"1088":1.80,
-    "1103":3.50,"1109":7.50,"1113":1.50,"1117":2.90,"1118":2.50,"1120":3.00,"1124":5.00,
-    "1137":1.50,"1144":2.50,"1149":10.00,"1153":10.00,"1164":2.00,"1173":7.50,"1182":2.00,"1183":1.00,
-    "1214":4.50,"1216":28.00,"1220":9.00,"1223":15.00,"1240":6.00,"1244":3.00,"1245":2.00,"1249":3.00,
-    "1253":3.00,"1268":20.00,"1270":2.00,"1274":3.50,"1275":3.00,"1284":2.00,"1289":0.50,"1293":18.00,"1296":15.00,
-    "1300":1.00,"1301":1.00,"1302":1.00,"1303":1.00,"1305":5.50,"1317":3.50,"1318":1.50,"1327":3.00,"1345":22.00,"1349":4.00,
-    "1350":4.50,"1351":5.00,"1354":8.00,"1355":18.00,"1360":65.00,"1362":2.50,"1364":3.00,
-    "2003":1.00,"2006":30.00,"2007":28.00,"2009":5.00,"2012":32.00,"2025":4.00,"2029":2.50,"2032":5.00,"2033":6.50,"2034":10.00,
-    "2047":8.00,"2052":2.00,"2054":26.00,"2059":1.00,"2062":3.00,"2070":2.50,"2074":5.00,"2079":2.50,"2080":3.50,"2081":4.50,
-    "2088":24.00,"2089":12.00,"2090":6.00,"2091":3.00,
-    "8800":5.00,"9302":1.00,"9310":1.00,"9311":1.00,"9312":25.00,"9313":35.00,"9314":3.00,"9315":3.00,
-    "9400":0.70,"9503":0.06,"9513":0.07,
-})
-
-PLU_DESCRIPTIONS.update({
-    "70":"Self-service A4 B&W print, one-sided","71":"Self-service A4 B&W copy, one-sided","72":"Self-service A3 B&W print, one-sided","73":"Self-service A3 B&W copy, one-sided",
-    "74":"Self-service A4 B&W print, double-sided","75":"Self-service A4 B&W copy, double-sided","76":"Self-service A3 B&W print, double-sided","77":"Self-service A3 B&W copy, double-sided",
-    "151":"A4 B&W scan","153":"A3 B&W scan","156":"Document upload / sending","160":"DVD","161":"CD","162":"Disc recording","163":"Disc copy","172":"Computer use, 15 minutes",
-    "396":"Large-format B&W scanning, 1 m²","397":"A0 B&W scanning","398":"A1 B&W scanning","399":"A2 B&W scanning",
-    "470":"Self-service A4 colour print, one-sided","471":"Self-service A4 colour copy, one-sided","472":"Self-service A3 colour print, one-sided","473":"Self-service A3 colour copy, one-sided",
-    "474":"Self-service A4 colour print, double-sided","475":"Self-service A4 colour copy, double-sided","476":"Self-service A3 colour print, double-sided","477":"Self-service A3 colour copy, double-sided",
-    "496":"Large-format colour scanning, 1 m²","497":"A0 colour scanning","498":"A1 colour scanning","499":"A2 colour scanning","500":"Computer editing, 15 minutes",
-    "561":"A4 colour scan","563":"A3 colour scan",
-    "751":"Leather-look hard cover AA, 20–40 sheets","753":"Leather-look hard cover A, 41–90 sheets","754":"Leather-look hard cover B, 91–120 sheets","755":"Leather-look hard cover C, 121–145 sheets",
-    "756":"Leather-look 18 mm hard cover with thermo binding, 130–160 sheets","757":"Leather-look 21 mm hard cover with thermo binding, 160–190 sheets","758":"Leather-look 24 mm hard cover with thermo binding, 190–220 sheets","759":"Leather-look 30 mm hard cover with thermo binding, 220–280 sheets","760":"Leather-look 36 mm hard cover with thermo binding, 280–340 sheets",
-    "767":"Matte thermal binding, 3 mm, 1–10 sheets","768":"Matte thermal binding, 5 mm, 25–40 sheets","769":"Clear thermal binding, 1 mm, 1–10 sheets","770":"Clear thermal binding, 3 mm, 10–25 sheets",
-    "771":"Clear thermal binding, 5 mm, 25–40 sheets","772":"Clear thermal binding, 7 mm, 40–55 sheets","773":"Clear thermal binding, 9 mm, 55–75 sheets","774":"Clear thermal binding, 12 mm, 75–100 sheets",
-    "775":"Clear thermal binding, 15 mm, 100–130 sheets","776":"Clear thermal binding, 18 mm, 130–160 sheets","791":"Binding channels, landscape","796":"White soft cover G/A",
-    "800":"White plastic spiral 6–8 mm","801":"White plastic spiral 10 mm","802":"White plastic spiral 12 mm","803":"White plastic spiral 14 mm","804":"Plastic spiral 16 mm, red or black","805":"White plastic spiral 19 mm",
-    "806":"White plastic spiral 22–25 mm","807":"White plastic spiral 28–32 mm","808":"White plastic spiral 38–45 mm","809":"White plastic spiral 50 mm or larger",
-    "810":"Red plastic spiral 6–8 mm","811":"Red plastic spiral 10 mm","812":"Red plastic spiral 12 mm","820":"Black plastic spiral 6–8 mm","821":"Black plastic spiral 10 mm","822":"Black plastic spiral 12 mm",
-    "824":"Red or black plastic spiral 16 mm","825":"Black plastic spiral 19 mm","827":"Black plastic spiral 28–32 mm","828":"Black plastic spiral 38–45 mm","829":"Black plastic spiral 50 mm or larger",
-    "830":"Blue plastic spiral 6–8 mm","831":"Blue plastic spiral 10 mm","832":"Blue plastic spiral 12 mm","840":"Green plastic spiral 6–8 mm","841":"Green plastic spiral 10 mm","842":"Green plastic spiral 12 mm","850":"Red screw-binding spiral 22 mm",
-    "880":"Plastic spiral binding, 1–50 sheets","881":"Plastic spiral binding, 51–150 sheets","882":"Plastic spiral binding, 151–250 sheets","883":"Plastic spiral binding, 251–340 sheets","884":"Plastic spiral binding, 341+ sheets",
-    "891":"A4 clear binding cover","892":"A4 coloured binding cover","893":"A4 matte binding cover","894":"A3 clear binding cover","895":"A4 binding back cover","896":"A3 binding back cover",
-    "900":"White screw-binding spiral 8 mm","901":"Black screw-binding spiral 8 mm","903":"White screw-binding spiral 10 mm","904":"Black screw-binding spiral 10 mm",
-    "1004":"White screw-binding spiral 12 mm","1068":"White screw-binding spiral 14 mm","1070":"White screw-binding spiral 16 mm","1072":"White screw-binding spiral 20 mm","1074":"White screw-binding spiral 25 mm","1076":"White screw-binding spiral 32 mm",
-    "1082":"Red screw-binding spiral 8 mm","1084":"Red screw-binding spiral 10 mm","1086":"Red screw-binding spiral 12 mm","1087":"Red screw-binding spiral 14 mm","1088":"Red screw-binding spiral 16 mm",
-    "1003":"Black screw-binding spiral 12 mm","1067":"Black screw-binding spiral 14 mm","1069":"Black screw-binding spiral 16 mm","1071":"Black screw-binding spiral 20 mm","1073":"Black screw-binding spiral 25 mm","1075":"Black screw-binding spiral 32 mm","1077":"Black screw-binding spiral 35 mm","1079":"Black screw-binding spiral 51 mm",
-    "1081":"Blue screw-binding spiral 8 mm","1083":"Blue screw-binding spiral 10 mm","1085":"Blue screw-binding spiral 12 mm","1002":"Clear screw-binding spiral 10 mm","1066":"Clear screw-binding spiral 12 mm",
-    "905":"A5–A6 lamination, 125 micron","906":"A4 lamination, 100–125 micron","907":"A3 lamination, 100–150 micron","908":"A4 adhesive lamination, 100 micron","910":"A4 thick lamination, 150–175 micron","914":"75 × 105 mm lamination, 175 micron","918":"A3 matte lamination, 125 micron",
-    "920":"Single-hole punching","921":"Two-hole punching, up to 50 sheets","922":"Four-hole punching, up to 50 sheets","924":"Corner rounding, one item","926":"Stapling, 1–50 sheets","927":"Stapling, 51–100 sheets","928":"Stapling, 101–150 sheets","929":"Metal/plastic rivets and similar work","930":"Other work",
-    "933":"Cutting, one cut","934":"Guillotine cutting","935":"Delivery by post or courier","936":"Rivet insertion","941":"Notary sticker","942":"Notarial document binding",
-    "1001":"Hard binding, landscape","1006":"A4/A5 document sleeve","1007":"A3 document sleeve","1009":"Folder with metal fastener","1011":"Lever arch file, 50 mm","1012":"Lever arch file, 70 mm","1015":"Paper CD sleeve","1016":"Adhesive CD sleeve",
-    "1019":"Standard A4 envelope","1020":"Standard A5 envelope","1021":"Standard A6 / long envelope","1025":"Lever arch file, 80 mm","1033":"Ring binder","1042":"Small glue stick, 8 g","1044":"Scissors",
-    "1062":"Cardboard business-card box","1103":"Instant glue","1109":"Double-sided adhesive tape","1113":"Standard pencil","1117":"Cardboard box","1118":"Automatic pen","1120":"Wide-format tube, narrow","1124":"Thick adhesive tape",
-    "1137":"Coloured push pins","1144":"Staples 24/6","1149":"A4 frame","1153":"A4 frame with thick border","1164":"Paper clips","1173":"Mounting squares","1182":"Paper bags","1183":"Brown kraft A4 envelope",
-    "1214":"Large coloured sheets","1216":"40 × 60 (A2) or 40 × 50 frame","1220":"15 × 21 (A5) frame with thick border","1223":"A3 frame","1240":"Small hole punch","1244":"PVA glue","1245":"Thin adhesive tape","1249":"Correction fluid",
-    "1253":"Pack of binder clips","1268":"16 GB USB flash drive","1270":"CopyPro pen","1274":"Markers","1275":"Adhesive tape with dispenser","1284":"Postcards","1289":"Binder clip","1293":"8 GB USB flash drive","1296":"Large hole punch",
-    "1300":"Printer cartridges","1301":"Canvas","1302":"Stamps","1303":"Stamp rubber","1305":"Window boxes","1317":"Glossy A4 envelope","1318":"Sticky notes","1327":"Gift bags","1345":"32 GB USB flash drive","1349":"Marker set",
-    "1350":"Wide-format tube, wide","1351":"10 × 15 (A6) frame","1354":"Printing on a bag","1355":"Printing on a T-shirt","1360":"A0 frame","1362":"Textured A5 envelope","1364":"Pack of 20 document sleeves",
-    "2003":"Printing on a mug","2006":"60 × 90 frame","2007":"50 × 70 frame","2009":"Satin ribbon","2012":"A1 frame","2025":"Large glossy coloured sheets","2029":"Gift ribbon","2032":"Memo note sheets","2033":"A5/A6 information holder","2034":"A4 information holder",
-    "2047":"Clear bags, 100 pcs","2052":"Adhesive ribbon","2054":"64 GB USB flash drive","2059":"Small calendars","2062":"Navigator paper, 150 sheets","2070":"CopyPro A6 / 14 × 18 envelopes","2074":"Decorative elements","2079":"CopyPro C65 envelopes","2080":"CopyPro A5 envelopes","2081":"CopyPro A4 envelopes",
-    "2088":"A0 frame backing board","2089":"A1 frame backing board","2090":"A2 frame backing board","2091":"A3 frame backing board",
-    "8800":"Rebinding","9302":"Plotting","9310":"Cup/trophy item","9311":"Medals","9312":"One-sided business-card layout design","9313":"Double-sided business-card layout design","9314":"Badge production","9315":"Keychain production",
-    "9400":"Notarial thread","9503":"A4 self-service paper, one sheet","9513":"A3 self-service paper, one sheet",
-})
-
-# Clear PLU/name pairs whose price is variable or was not unambiguous.
-PLU_DESCRIPTIONS.update({
-    "1219": "13 × 18 / A5 frame",
-    "1237": "Staple remover",
-    "1294": "Padded envelope",
-    "1991": "Jigsaw puzzle production (price varies by puzzle)",
-    "9316": "Magnet production",
-})
-PLU_PRICES["9316"] = 2.00
-
-
-# Wide-format colour printing and materials.
-# Prices and descriptions are taken from the current in-store wide-format list.
+# Product codes, names, prices, search aliases, wide-format rows and paper sizes
+# are loaded exclusively from the selected Excel workbooks.
+#
+# No catalogue or pricing fallback is embedded in the Python application.
+PLU_PRICES = {}
+PLU_DESCRIPTIONS = {}
+PLU_SEARCH_ALIASES = {}
+WIDE_FORMAT_ITEMS = {}
 WIDE_FORMAT_ORDER = []
-WIDE_FORMAT_ITEMS = {
-    "4800": ("80 gsm paprastas / brėžinys", 0.95, "drawing"),
-    "4810": ("80 gsm paprastas / tekstas+pav.", 1.40, "partial"),
-    "4820": ("80 gsm paprastas / paveikslas", 1.60, "full"),
-    "4830": ("120 gsm storesnis / tekstas+pav.", 1.70, "partial"),
-    "4840": ("120 gsm storesnis / paveikslas", 2.10, "full"),
-    "4913": ("140 gsm storas / tekstas+paveikslas", 2.35, "partial"),
-    "4914": ("140 gsm storas / paveikslas", 2.30, "full"),
-    "4850": ("180 gsm storas / tekstas+paveikslas", 2.40, "partial"),
-    "4860": ("180 gsm storas / paveikslas", 2.55, "full"),
-    "4894": ("Satin / fotopopierius / tekstas+pav.", 2.80, "partial"),
-    "4893": ("Satin / fotopopierius / paveikslas", 3.20, "full"),
-    "4915": ("Sintetinė drobė", 2.80, "fixed"),
-    "4900": ("Natūrali drobė", 3.30, "fixed"),
-    "4902": ("Film plėvelė / tekstas+paveikslas", 2.90, "partial"),
-    "4903": ("Film plėvelė / paveikslas", 3.30, "full"),
-    "4908": ("Lipdukas PVC / tekstas+paveikslas", 3.00, "partial"),
-    "4909": ("Lipdukas PVC / paveikslas", 3.20, "full"),
-    "4910": ("Kalkė / brėžinys", 1.70, "drawing"),
-    "4911": ("Kalkė / tekstas+paveikslas", 2.20, "partial"),
-    "4912": ("Kalkė / paveikslas", 2.50, "full"),
-    "3009": ("Spausdinimas ant vatmano", 14.00, "fixed"),
-    "4916": ("Karštas laminatas", 1.80, "fixed"),
-    "4917": ("Magnetinė plėvelė", 2.50, "fixed"),
-    "3008": ("Vatmanas 90×64 cm (240 gsm)", 3.00, "fixed"),
-}
-for _code, (_description, _price, _coverage) in WIDE_FORMAT_ITEMS.items():
-    PLU_DESCRIPTIONS[_code] = _description
-    PLU_PRICES[_code] = _price
-
-# Editable external data. Paths are stored in AppData/CopyPro/settings.json.
-_EMBEDDED_CODE_ITEMS = [{'code': '10', 'name': 'A4 nespalvota kopija, vienpusis, 1–100', 'price': 0.15, 'aliases': []},
- {'code': '11', 'name': 'A4 nespalvota kopija, vienpusis, 101–500', 'price': 0.1, 'aliases': []},
- {'code': '12', 'name': 'A4 nespalvota kopija, vienpusis, 501–1000', 'price': 0.08, 'aliases': []},
- {'code': '13', 'name': 'A4 nespalvota kopija, vienpusis, 1001+', 'price': 0.07, 'aliases': []},
- {'code': '20', 'name': 'A4 nespalvota kopija, dvipusis, 1–100', 'price': 0.25, 'aliases': []},
- {'code': '21', 'name': 'A4 nespalvota kopija, dvipusis, 101–500', 'price': 0.2, 'aliases': []},
- {'code': '22', 'name': 'A4 nespalvota kopija, dvipusis, 501–1000', 'price': 0.15, 'aliases': []},
- {'code': '23', 'name': 'A4 nespalvota kopija, dvipusis, 1001+', 'price': 0.12, 'aliases': []},
- {'code': '30', 'name': 'A3 nespalvota kopija, vienpusis, 1–100', 'price': 0.3, 'aliases': []},
- {'code': '31', 'name': 'A3 nespalvota kopija, vienpusis, 101–500', 'price': 0.25, 'aliases': []},
- {'code': '32', 'name': 'A3 nespalvota kopija, vienpusis, 501–1000', 'price': 0.2, 'aliases': []},
- {'code': '33', 'name': 'A3 nespalvota kopija, vienpusis, 1001+', 'price': 0.15, 'aliases': []},
- {'code': '40', 'name': 'A3 nespalvota kopija, dvipusis, 1–100', 'price': 0.5, 'aliases': []},
- {'code': '41', 'name': 'A3 nespalvota kopija, dvipusis, 101–500', 'price': 0.45, 'aliases': []},
- {'code': '42', 'name': 'A3 nespalvota kopija, dvipusis, 501–1000', 'price': 0.4, 'aliases': []},
- {'code': '43', 'name': 'A3 nespalvota kopija, dvipusis, 1001+', 'price': 0.25, 'aliases': []},
- {'code': '50', 'name': 'A4 nespalvota kopija nuo stiklo, vienpusis', 'price': 0.3, 'aliases': []},
- {'code': '51', 'name': 'A4 nespalvota kopija nuo stiklo, dvipusis', 'price': 0.5, 'aliases': []},
- {'code': '52', 'name': 'A3 nespalvota kopija nuo stiklo, vienpusis', 'price': 0.4, 'aliases': []},
- {'code': '53', 'name': 'A3 nespalvota kopija nuo stiklo, dvipusis', 'price': 0.6, 'aliases': []},
- {'code': '60', 'name': 'Mazinimas / didinimas', 'price': 0.2, 'aliases': []},
- {'code': '70', 'name': 'Self-service A4 nespalvota spausdinimas, vienpusis', 'price': 0.13, 'aliases': []},
- {'code': '71', 'name': 'Self-service A4 nespalvota kopija, vienpusis', 'price': 0.13, 'aliases': []},
- {'code': '72', 'name': 'Self-service A3 nespalvota spausdinimas, vienpusis', 'price': 0.25, 'aliases': []},
- {'code': '73', 'name': 'Self-service A3 nespalvota kopija, vienpusis', 'price': 0.25, 'aliases': []},
- {'code': '74', 'name': 'Self-service A4 nespalvota spausdinimas, dvipusis', 'price': 0.25, 'aliases': []},
- {'code': '75', 'name': 'Self-service A4 nespalvota kopija, dvipusis', 'price': 0.25, 'aliases': []},
- {'code': '76', 'name': 'Self-service A3 nespalvota spausdinimas, dvipusis', 'price': 0.45, 'aliases': []},
- {'code': '77', 'name': 'Self-service A3 nespalvota kopija, dvipusis', 'price': 0.45, 'aliases': []},
- {'code': '110', 'name': 'A4 nespalvota spausdinimas, vienpusis, 1–100', 'price': 0.15, 'aliases': []},
- {'code': '111', 'name': 'A4 nespalvota spausdinimas, vienpusis, 101–500', 'price': 0.1, 'aliases': []},
- {'code': '112', 'name': 'A4 nespalvota spausdinimas, vienpusis, 501–1000', 'price': 0.08, 'aliases': []},
- {'code': '113', 'name': 'A4 nespalvota spausdinimas, vienpusis, 1001+', 'price': 0.07, 'aliases': []},
- {'code': '120', 'name': 'A4 nespalvota spausdinimas, dvipusis, 1–100', 'price': 0.25, 'aliases': []},
- {'code': '121', 'name': 'A4 nespalvota spausdinimas, dvipusis, 101–500', 'price': 0.2, 'aliases': []},
- {'code': '122', 'name': 'A4 nespalvota spausdinimas, dvipusis, 501–1000', 'price': 0.15, 'aliases': []},
- {'code': '123', 'name': 'A4 nespalvota spausdinimas, dvipusis, 1001+', 'price': 0.12, 'aliases': []},
- {'code': '130', 'name': 'A3 nespalvota spausdinimas, vienpusis, 1–100', 'price': 0.3, 'aliases': []},
- {'code': '131', 'name': 'A3 nespalvota spausdinimas, vienpusis, 101–500', 'price': 0.25, 'aliases': []},
- {'code': '132', 'name': 'A3 nespalvota spausdinimas, vienpusis, 501–1000', 'price': 0.2, 'aliases': []},
- {'code': '133', 'name': 'A3 nespalvota spausdinimas, vienpusis, 1001+', 'price': 0.15, 'aliases': []},
- {'code': '140', 'name': 'A3 nespalvota spausdinimas, dvipusis, 1–100', 'price': 0.5, 'aliases': []},
- {'code': '141', 'name': 'A3 nespalvota spausdinimas, dvipusis, 101–500', 'price': 0.45, 'aliases': []},
- {'code': '142', 'name': 'A3 nespalvota spausdinimas, dvipusis, 501–1000', 'price': 0.4, 'aliases': []},
- {'code': '143', 'name': 'A3 nespalvota spausdinimas, dvipusis, 1001+', 'price': 0.25, 'aliases': []},
- {'code': '151', 'name': 'A4 nespalvota skenavimas', 'price': 0.3, 'aliases': []},
- {'code': '153', 'name': 'A3 nespalvota skenavimas', 'price': 0.4, 'aliases': []},
- {'code': '156', 'name': 'Document upload / sending', 'price': 0.3, 'aliases': []},
- {'code': '160', 'name': 'DVD', 'price': 2.0, 'aliases': []},
- {'code': '161', 'name': 'CD', 'price': 2.0, 'aliases': []},
- {'code': '162', 'name': 'Disc recording', 'price': 3.0, 'aliases': []},
- {'code': '163', 'name': 'Disc kopija', 'price': 3.0, 'aliases': []},
- {'code': '172', 'name': 'Computer use, 15 minutes', 'price': 1.0, 'aliases': []},
- {'code': '310', 'name': 'A4 nespalvota INEO spausdinimas, vienpusis, 1–100', 'price': 0.15, 'aliases': []},
- {'code': '311', 'name': 'A4 nespalvota INEO spausdinimas, vienpusis, 101–500', 'price': 0.1, 'aliases': []},
- {'code': '312', 'name': 'A4 nespalvota INEO spausdinimas, vienpusis, 501–1000', 'price': 0.08, 'aliases': []},
- {'code': '313', 'name': 'A4 nespalvota INEO spausdinimas, vienpusis, 1001+', 'price': 0.07, 'aliases': []},
- {'code': '320', 'name': 'A4 nespalvota INEO spausdinimas, dvipusis, 1–100', 'price': 0.25, 'aliases': []},
- {'code': '321', 'name': 'A4 nespalvota INEO spausdinimas, dvipusis, 101–500', 'price': 0.2, 'aliases': []},
- {'code': '322', 'name': 'A4 nespalvota INEO spausdinimas, dvipusis, 501–1000', 'price': 0.15, 'aliases': []},
- {'code': '323', 'name': 'A4 nespalvota INEO spausdinimas, dvipusis, 1001+', 'price': 0.12, 'aliases': []},
- {'code': '330', 'name': 'A3 nespalvota INEO spausdinimas, vienpusis, 1–100', 'price': 0.3, 'aliases': []},
- {'code': '331', 'name': 'A3 nespalvota INEO spausdinimas, vienpusis, 101–500', 'price': 0.25, 'aliases': []},
- {'code': '332', 'name': 'A3 nespalvota INEO spausdinimas, vienpusis, 501–1000', 'price': 0.2, 'aliases': []},
- {'code': '333', 'name': 'A3 nespalvota INEO spausdinimas, vienpusis, 1001+', 'price': 0.15, 'aliases': []},
- {'code': '340', 'name': 'A3 nespalvota INEO spausdinimas, dvipusis, 1–100', 'price': 0.5, 'aliases': []},
- {'code': '341', 'name': 'A3 nespalvota INEO spausdinimas, dvipusis, 101–500', 'price': 0.45, 'aliases': []},
- {'code': '342', 'name': 'A3 nespalvota INEO spausdinimas, dvipusis, 501–1000', 'price': 0.4, 'aliases': []},
- {'code': '343', 'name': 'A3 nespalvota INEO spausdinimas, dvipusis, 1001+', 'price': 0.25, 'aliases': []},
- {'code': '396', 'name': 'Large-format nespalvota skenavimasning, 1 m²', 'price': 3.5, 'aliases': []},
- {'code': '397', 'name': 'A0 nespalvota skenavimasning', 'price': 3.5, 'aliases': []},
- {'code': '398', 'name': 'A1 nespalvota skenavimasning', 'price': 2.0, 'aliases': []},
- {'code': '399', 'name': 'A2 nespalvota skenavimasning', 'price': 1.5, 'aliases': []},
- {'code': '450', 'name': 'A4 nespalvota spausdinimas ant 90 gsm popieriaus', 'price': 0.5, 'aliases': []},
- {'code': '451', 'name': 'A3 nespalvota spausdinimas ant 90 gsm popieriaus', 'price': 0.8, 'aliases': []},
- {'code': '470', 'name': 'Self-service A4 spalvota spausdinimas, vienpusis', 'price': 0.65, 'aliases': []},
- {'code': '471', 'name': 'Self-service A4 spalvota kopija, vienpusis', 'price': 0.65, 'aliases': []},
- {'code': '472', 'name': 'Self-service A3 spalvota spausdinimas, vienpusis', 'price': 1.3, 'aliases': []},
- {'code': '473', 'name': 'Self-service A3 spalvota kopija, vienpusis', 'price': 1.3, 'aliases': []},
- {'code': '474', 'name': 'Self-service A4 spalvota spausdinimas, dvipusis', 'price': 1.3, 'aliases': []},
- {'code': '475', 'name': 'Self-service A4 spalvota kopija, dvipusis', 'price': 1.3, 'aliases': []},
- {'code': '476', 'name': 'Self-service A3 spalvota spausdinimas, dvipusis', 'price': 2.6, 'aliases': []},
- {'code': '477', 'name': 'Self-service A3 spalvota kopija, dvipusis', 'price': 2.6, 'aliases': []},
- {'code': '496', 'name': 'Large-format spalvota skenavimasning, 1 m²', 'price': 6.5, 'aliases': []},
- {'code': '497', 'name': 'A0 spalvota skenavimasning', 'price': 6.5, 'aliases': []},
- {'code': '498', 'name': 'A1 spalvota skenavimasning', 'price': 3.5, 'aliases': []},
- {'code': '499', 'name': 'A2 spalvota skenavimasning', 'price': 2.0, 'aliases': []},
- {'code': '500', 'name': 'Computer editing, 15 minutes', 'price': 7.0, 'aliases': []},
- {'code': '510', 'name': 'A4 spalvota spausdinimas, vienpusis, 1–10', 'price': 0.95, 'aliases': []},
- {'code': '511', 'name': 'A4 spalvota spausdinimas, vienpusis, 11–50', 'price': 0.85, 'aliases': []},
- {'code': '512', 'name': 'A4 spalvota spausdinimas, vienpusis, 51–100', 'price': 0.75, 'aliases': []},
- {'code': '513', 'name': 'A4 spalvota spausdinimas, vienpusis, 101–500', 'price': 0.65, 'aliases': []},
- {'code': '520', 'name': 'A4 spalvota spausdinimas, dvipusis, 1–10', 'price': 1.65, 'aliases': []},
- {'code': '521', 'name': 'A4 spalvota spausdinimas, dvipusis, 11–50', 'price': 1.5, 'aliases': []},
- {'code': '522', 'name': 'A4 spalvota spausdinimas, dvipusis, 51–100', 'price': 1.3, 'aliases': []},
- {'code': '523', 'name': 'A4 spalvota spausdinimas, dvipusis, 101–500', 'price': 1.1, 'aliases': []},
- {'code': '530', 'name': 'A3 spalvota spausdinimas, vienpusis, 1–10', 'price': 1.6, 'aliases': []},
- {'code': '531', 'name': 'A3 spalvota spausdinimas, vienpusis, 11–50', 'price': 1.5, 'aliases': []},
- {'code': '532', 'name': 'A3 spalvota spausdinimas, vienpusis, 51–100', 'price': 1.35, 'aliases': []},
- {'code': '533', 'name': 'A3 spalvota spausdinimas, vienpusis, 101–500', 'price': 1.2, 'aliases': []},
- {'code': '540', 'name': 'A3 spalvota spausdinimas, dvipusis, 1–10', 'price': 2.9, 'aliases': []},
- {'code': '541', 'name': 'A3 spalvota spausdinimas, dvipusis, 11–50', 'price': 2.75, 'aliases': []},
- {'code': '542', 'name': 'A3 spalvota spausdinimas, dvipusis, 51–100', 'price': 2.5, 'aliases': []},
- {'code': '543', 'name': 'A3 spalvota spausdinimas, dvipusis, 101–500', 'price': 2.0, 'aliases': []},
- {'code': '561', 'name': 'A4 spalvota skenavimas', 'price': 0.8, 'aliases': []},
- {'code': '563', 'name': 'A3 spalvota skenavimas', 'price': 1.1, 'aliases': []},
- {'code': '650', 'name': 'A4 nespalvota spausdinimas ant kito popieriaus', 'price': 0.5, 'aliases': []},
- {'code': '651', 'name': 'A3 nespalvota spausdinimas ant kito popieriaus', 'price': 0.8, 'aliases': []},
- {'code': '710', 'name': 'A4 spalvota spausdinimas ant kito popieriaus, vienpusis, 1–10', 'price': 0.95, 'aliases': []},
- {'code': '711', 'name': 'A4 spalvota spausdinimas ant kito popieriaus, vienpusis, 11–50', 'price': 0.85, 'aliases': []},
- {'code': '712', 'name': 'A4 spalvota spausdinimas ant kito popieriaus, vienpusis, 51–100', 'price': 0.75, 'aliases': []},
- {'code': '713', 'name': 'A4 spalvota spausdinimas ant kito popieriaus, vienpusis, 101–500', 'price': 0.65, 'aliases': []},
- {'code': '720', 'name': 'A4 spalvota spausdinimas ant kito popieriaus, dvipusis, 1–10', 'price': 1.65, 'aliases': []},
- {'code': '721', 'name': 'A4 spalvota spausdinimas ant kito popieriaus, dvipusis, 11–50', 'price': 1.5, 'aliases': []},
- {'code': '722', 'name': 'A4 spalvota spausdinimas ant kito popieriaus, dvipusis, 51–100', 'price': 1.3, 'aliases': []},
- {'code': '723', 'name': 'A4 spalvota spausdinimas ant kito popieriaus, dvipusis, 101–500', 'price': 1.1, 'aliases': []},
- {'code': '730', 'name': 'A3 spalvota spausdinimas ant kito popieriaus, vienpusis, 1–10', 'price': 1.6, 'aliases': []},
- {'code': '731', 'name': 'A3 spalvota spausdinimas ant kito popieriaus, vienpusis, 11–50', 'price': 1.5, 'aliases': []},
- {'code': '732', 'name': 'A3 spalvota spausdinimas ant kito popieriaus, vienpusis, 51–100', 'price': 1.35, 'aliases': []},
- {'code': '733', 'name': 'A3 spalvota spausdinimas ant kito popieriaus, vienpusis, 101–500', 'price': 1.2, 'aliases': []},
- {'code': '740', 'name': 'A3 spalvota spausdinimas ant kito popieriaus, dvipusis, 1–10', 'price': 2.9, 'aliases': []},
- {'code': '741', 'name': 'A3 spalvota spausdinimas ant kito popieriaus, dvipusis, 11–50', 'price': 2.75, 'aliases': []},
- {'code': '742', 'name': 'A3 spalvota spausdinimas ant kito popieriaus, dvipusis, 51–100', 'price': 2.5, 'aliases': []},
- {'code': '743', 'name': 'A3 spalvota spausdinimas ant kito popieriaus, dvipusis, 101–500', 'price': 2.0, 'aliases': []},
- {'code': '751', 'name': 'Odos imitacijos kietas virselis AA, 20–40 lapai', 'price': 8.0, 'aliases': []},
- {'code': '753', 'name': 'Odos imitacijos kietas virselis A, 41–90 lapai', 'price': 8.5, 'aliases': []},
- {'code': '754', 'name': 'Odos imitacijos kietas virselis B, 91–120 lapai', 'price': 8.6, 'aliases': []},
- {'code': '755', 'name': 'Odos imitacijos kietas virselis C, 121–145 lapai', 'price': 8.9, 'aliases': []},
- {'code': '756', 'name': 'Odos imitacijos 18 mm kietas virselis with terminis irisimas, 130–160 lapai', 'price': 8.9, 'aliases': []},
- {'code': '757', 'name': 'Odos imitacijos 21 mm kietas virselis with terminis irisimas, 160–190 lapai', 'price': 9.0, 'aliases': []},
- {'code': '758', 'name': 'Odos imitacijos 24 mm kietas virselis with terminis irisimas, 190–220 lapai', 'price': 9.4, 'aliases': []},
- {'code': '759', 'name': 'Odos imitacijos 30 mm kietas virselis with terminis irisimas, 220–280 lapai', 'price': 9.8, 'aliases': []},
- {'code': '760', 'name': 'Odos imitacijos 36 mm kietas virselis with terminis irisimas, 280–340 lapai', 'price': 10.2, 'aliases': []},
- {'code': '767', 'name': 'Matinis terminis irisimas, 3 mm, 1–10 lapai', 'price': 4.5, 'aliases': []},
- {'code': '768', 'name': 'Matinis terminis irisimas, 5 mm, 25–40 lapai', 'price': 5.2, 'aliases': []},
- {'code': '769', 'name': 'Skaidrus terminis irisimas, 1 mm, 1–10 lapai', 'price': 4.5, 'aliases': []},
- {'code': '770', 'name': 'Skaidrus terminis irisimas, 3 mm, 10–25 lapai', 'price': 4.9, 'aliases': []},
- {'code': '771', 'name': 'Skaidrus terminis irisimas, 5 mm, 25–40 lapai', 'price': 5.2, 'aliases': []},
- {'code': '772', 'name': 'Skaidrus terminis irisimas, 7 mm, 40–55 lapai', 'price': 5.5, 'aliases': []},
- {'code': '773', 'name': 'Skaidrus terminis irisimas, 9 mm, 55–75 lapai', 'price': 6.0, 'aliases': []},
- {'code': '774', 'name': 'Skaidrus terminis irisimas, 12 mm, 75–100 lapai', 'price': 6.2, 'aliases': []},
- {'code': '775', 'name': 'Skaidrus terminis irisimas, 15 mm, 100–130 lapai', 'price': 6.5, 'aliases': []},
- {'code': '776', 'name': 'Skaidrus terminis irisimas, 18 mm, 130–160 lapai', 'price': 6.8, 'aliases': []},
- {'code': '791', 'name': 'Irisimas channels, gulscias', 'price': 3.0, 'aliases': []},
- {'code': '796', 'name': 'Baltas minkstas virselis G/A', 'price': 5.5, 'aliases': []},
- {'code': '800', 'name': 'Baltas plastikine spirale 6–8 mm', 'price': 0.5, 'aliases': []},
- {'code': '801', 'name': 'Baltas plastikine spirale 10 mm', 'price': 0.6, 'aliases': []},
- {'code': '802', 'name': 'Baltas plastikine spirale 12 mm', 'price': 0.7, 'aliases': []},
- {'code': '803', 'name': 'Baltas plastikine spirale 14 mm', 'price': 0.8, 'aliases': []},
- {'code': '804', 'name': 'Plastikine spirale 16 mm, raudona arba juoda', 'price': 0.9, 'aliases': []},
- {'code': '805', 'name': 'Baltas plastikine spirale 19 mm', 'price': 1.0, 'aliases': []},
- {'code': '806', 'name': 'Baltas plastikine spirale 22–25 mm', 'price': 1.5, 'aliases': []},
- {'code': '807', 'name': 'Baltas plastikine spirale 28–32 mm', 'price': 2.2, 'aliases': []},
- {'code': '808', 'name': 'Baltas plastikine spirale 38–45 mm', 'price': 2.7, 'aliases': []},
- {'code': '809', 'name': 'Baltas plastikine spirale 50 mm arba didesne', 'price': 3.2, 'aliases': []},
- {'code': '810', 'name': 'Raudona plastikine spirale 6–8 mm', 'price': 0.5, 'aliases': []},
- {'code': '811', 'name': 'Raudona plastikine spirale 10 mm', 'price': 0.6, 'aliases': []},
- {'code': '812', 'name': 'Raudona plastikine spirale 12 mm', 'price': 0.7, 'aliases': []},
- {'code': '820', 'name': 'Juodas plastikine spirale 6–8 mm', 'price': 0.5, 'aliases': []},
- {'code': '821', 'name': 'Juodas plastikine spirale 10 mm', 'price': 0.6, 'aliases': []},
- {'code': '822', 'name': 'Juodas plastikine spirale 12 mm', 'price': 0.7, 'aliases': []},
- {'code': '824', 'name': 'Raudona arba juoda plastikine spirale 16 mm', 'price': 0.9, 'aliases': []},
- {'code': '825', 'name': 'Juodas plastikine spirale 19 mm', 'price': 1.0, 'aliases': []},
- {'code': '827', 'name': 'Juodas plastikine spirale 28–32 mm', 'price': 2.0, 'aliases': []},
- {'code': '828', 'name': 'Juodas plastikine spirale 38–45 mm', 'price': 2.5, 'aliases': []},
- {'code': '829', 'name': 'Juodas plastikine spirale 50 mm arba didesne', 'price': 3.2, 'aliases': []},
- {'code': '830', 'name': 'Melyna plastikine spirale 6–8 mm', 'price': 0.25, 'aliases': []},
- {'code': '831', 'name': 'Melyna plastikine spirale 10 mm', 'price': 0.3, 'aliases': []},
- {'code': '832', 'name': 'Melyna plastikine spirale 12 mm', 'price': 0.35, 'aliases': []},
- {'code': '840', 'name': 'Zalia plastikine spirale 6–8 mm', 'price': 0.25, 'aliases': []},
- {'code': '841', 'name': 'Zalia plastikine spirale 10 mm', 'price': 0.3, 'aliases': []},
- {'code': '842', 'name': 'Zalia plastikine spirale 12 mm', 'price': 0.3, 'aliases': []},
- {'code': '850', 'name': 'Raudona sukama spirale 22 mm', 'price': 3.2, 'aliases': []},
- {'code': '880', 'name': 'Irisimas plastikine spirale, 1–50 lapai', 'price': 3.0, 'aliases': []},
- {'code': '881', 'name': 'Irisimas plastikine spirale, 51–150 lapai', 'price': 3.5, 'aliases': []},
- {'code': '882', 'name': 'Irisimas plastikine spirale, 151–250 lapai', 'price': 4.5, 'aliases': []},
- {'code': '883', 'name': 'Irisimas plastikine spirale, 251–340 lapai', 'price': 5.5, 'aliases': []},
- {'code': '884', 'name': 'Irisimas plastikine spirale, 341+ lapai', 'price': 6.0, 'aliases': []},
- {'code': '891', 'name': 'A4 skaidrus irisimo virselis', 'price': 1.2, 'aliases': []},
- {'code': '892', 'name': 'A4 spalvotaed irisimo virselis', 'price': 1.2, 'aliases': []},
- {'code': '893', 'name': 'A4 matinis irisimo virselis', 'price': 1.2, 'aliases': []},
- {'code': '894', 'name': 'A3 skaidrus irisimo virselis', 'price': 2.0, 'aliases': []},
- {'code': '895', 'name': 'A4 irisimo galinis virselis', 'price': 1.2, 'aliases': []},
- {'code': '896', 'name': 'A3 irisimo galinis virselis', 'price': 2.0, 'aliases': []},
- {'code': '899', 'name': 'A4 dekoratyvinis popierius', 'price': 2.0, 'aliases': []},
- {'code': '900', 'name': 'Baltas sukama spirale 8 mm', 'price': 1.0, 'aliases': []},
- {'code': '901', 'name': 'Juodas sukama spirale 8 mm', 'price': 1.0, 'aliases': []},
- {'code': '903', 'name': 'Baltas sukama spirale 10 mm', 'price': 1.2, 'aliases': []},
- {'code': '904', 'name': 'Juodas sukama spirale 10 mm', 'price': 1.2, 'aliases': []},
- {'code': '905', 'name': 'A5–A6 laminavimas, 125 micron', 'price': 2.0, 'aliases': []},
- {'code': '906', 'name': 'A4 laminavimas, 100–125 micron', 'price': 2.5, 'aliases': []},
- {'code': '907', 'name': 'A3 laminavimas, 100–150 micron', 'price': 3.5, 'aliases': []},
- {'code': '908', 'name': 'A4 lipnus laminavimas, 100 micron', 'price': 3.5, 'aliases': []},
- {'code': '910', 'name': 'A4 thick laminavimas, 150–175 micron', 'price': 2.8, 'aliases': []},
- {'code': '914', 'name': '75 × 105 mm laminavimas, 175 micron', 'price': 1.5, 'aliases': []},
- {'code': '918', 'name': 'A3 matinis laminavimas, 125 micron', 'price': 4.2, 'aliases': []},
- {'code': '920', 'name': 'Single-hole punching', 'price': 0.25, 'aliases': []},
- {'code': '921', 'name': 'Two-hole punching, up to 50 lapai', 'price': 0.6, 'aliases': []},
- {'code': '922', 'name': 'Four-hole punching, up to 50 lapai', 'price': 0.8, 'aliases': []},
- {'code': '924', 'name': 'Corner rounding, one item', 'price': 0.6, 'aliases': []},
- {'code': '926', 'name': 'Stapling, 1–50 lapai', 'price': 0.8, 'aliases': []},
- {'code': '927', 'name': 'Stapling, 51–100 lapai', 'price': 1.5, 'aliases': []},
- {'code': '928', 'name': 'Stapling, 101–150 lapai', 'price': 2.0, 'aliases': []},
- {'code': '929', 'name': 'Metalines/plastikines kniedes ir panasus darbai', 'price': 2.5, 'aliases': []},
- {'code': '930', 'name': 'Kiti darbai', 'price': 1.0, 'aliases': []},
- {'code': '933', 'name': 'Pjaustymas, vienas pjuvis', 'price': 0.1, 'aliases': []},
- {'code': '934', 'name': 'Guillotine pjaustymas', 'price': 0.5, 'aliases': []},
- {'code': '935', 'name': 'Pristatymas pastu arba kurjeriu', 'price': 1.0, 'aliases': []},
- {'code': '936', 'name': 'Kniedes idejimas', 'price': 0.5, 'aliases': []},
- {'code': '941', 'name': 'Notary lipdukas', 'price': 0.5, 'aliases': []},
- {'code': '942', 'name': 'Notarinio dokumento surisimas', 'price': 1.2, 'aliases': []},
- {'code': '954', 'name': '80 gsm spalvotaed A4 popierius', 'price': 0.7, 'aliases': []},
- {'code': '956', 'name': '160 gsm spalvotaed A4 popierius', 'price': 0.8, 'aliases': []},
- {'code': '966', 'name': 'SRA3 lipnus lapas', 'price': 3.5, 'aliases': []},
- {'code': '988', 'name': '135–250 gsm A4 foto popierius', 'price': 1.0, 'aliases': []},
- {'code': '999', 'name': 'A4 skaidre', 'price': 2.0, 'aliases': []},
- {'code': '1001', 'name': 'Kietas irisimas, gulscias', 'price': 6.5, 'aliases': []},
- {'code': '1002', 'name': 'Skaidrus sukama spirale 10 mm', 'price': 1.2, 'aliases': []},
- {'code': '1003', 'name': 'Juodas sukama spirale 12 mm', 'price': 1.0, 'aliases': []},
- {'code': '1004', 'name': 'Baltas sukama spirale 12 mm', 'price': 1.3, 'aliases': []},
- {'code': '1006', 'name': 'A4/A5 document sleeve', 'price': 0.2, 'aliases': []},
- {'code': '1007', 'name': 'A3 document sleeve', 'price': 1.5, 'aliases': []},
- {'code': '1009', 'name': 'Folder with metal fastener', 'price': 2.0, 'aliases': []},
- {'code': '1011', 'name': 'Lever arch file, 50 mm', 'price': 6.0, 'aliases': []},
- {'code': '1012', 'name': 'Lever arch file, 70 mm', 'price': 7.0, 'aliases': []},
- {'code': '1015', 'name': 'Popierius CD sleeve', 'price': 0.5, 'aliases': []},
- {'code': '1016', 'name': 'Adhesive CD sleeve', 'price': 2.5, 'aliases': []},
- {'code': '1019', 'name': 'Standard A4 vokas', 'price': 1.0, 'aliases': []},
- {'code': '1020', 'name': 'Standard A5 vokas', 'price': 0.7, 'aliases': []},
- {'code': '1021', 'name': 'Standard A6 / long vokas', 'price': 0.6, 'aliases': []},
- {'code': '1025', 'name': 'Lever arch file, 80 mm', 'price': 8.0, 'aliases': []},
- {'code': '1033', 'name': 'Ring binder', 'price': 6.5, 'aliases': []},
- {'code': '1042', 'name': 'Small glue stick, 8 g', 'price': 3.0, 'aliases': []},
- {'code': '1044', 'name': 'Scissors', 'price': 4.5, 'aliases': []},
- {'code': '1062', 'name': 'Korteleboard vizitiniu korteliu dezute', 'price': 0.5, 'aliases': []},
- {'code': '1066', 'name': 'Skaidrus sukama spirale 12 mm', 'price': 1.2, 'aliases': []},
- {'code': '1067', 'name': 'Juodas sukama spirale 14 mm', 'price': 1.5, 'aliases': []},
- {'code': '1068', 'name': 'Baltas sukama spirale 14 mm', 'price': 1.4, 'aliases': []},
- {'code': '1069', 'name': 'Juodas sukama spirale 16 mm', 'price': 1.8, 'aliases': []},
- {'code': '1070', 'name': 'Baltas sukama spirale 16 mm', 'price': 1.7, 'aliases': []},
- {'code': '1071', 'name': 'Juodas sukama spirale 20 mm', 'price': 2.7, 'aliases': []},
- {'code': '1072', 'name': 'Baltas sukama spirale 20 mm', 'price': 2.7, 'aliases': []},
- {'code': '1073', 'name': 'Juodas sukama spirale 25 mm', 'price': 3.7, 'aliases': []},
- {'code': '1074', 'name': 'Baltas sukama spirale 25 mm', 'price': 3.6, 'aliases': []},
- {'code': '1075', 'name': 'Juodas sukama spirale 32 mm', 'price': 5.0, 'aliases': []},
- {'code': '1076', 'name': 'Baltas sukama spirale 32 mm', 'price': 5.2, 'aliases': []},
- {'code': '1077', 'name': 'Juodas sukama spirale 35 mm', 'price': 5.0, 'aliases': []},
- {'code': '1079', 'name': 'Juodas sukama spirale 51 mm', 'price': 7.0, 'aliases': []},
- {'code': '1081', 'name': 'Melyna sukama spirale 8 mm', 'price': 0.7, 'aliases': []},
- {'code': '1082', 'name': 'Raudona sukama spirale 8 mm', 'price': 1.0, 'aliases': []},
- {'code': '1083', 'name': 'Melyna sukama spirale 10 mm', 'price': 0.9, 'aliases': []},
- {'code': '1084', 'name': 'Raudona sukama spirale 10 mm', 'price': 1.3, 'aliases': []},
- {'code': '1085', 'name': 'Melyna sukama spirale 12 mm', 'price': 0.9, 'aliases': []},
- {'code': '1086', 'name': 'Raudona sukama spirale 12 mm', 'price': 1.5, 'aliases': []},
- {'code': '1087', 'name': 'Raudona sukama spirale 14 mm', 'price': 1.6, 'aliases': []},
- {'code': '1088', 'name': 'Raudona sukama spirale 16 mm', 'price': 1.8, 'aliases': []},
- {'code': '1090', 'name': '350–400 gsm A3/SRA3 foto popierius', 'price': 2.5, 'aliases': []},
- {'code': '1092', 'name': 'Teksturinis A3/SRA3 popierius', 'price': 2.5, 'aliases': []},
- {'code': '1095', 'name': 'Ilgaamzis neplystantis A3 popierius', 'price': 3.5, 'aliases': []},
- {'code': '1096', 'name': 'Magnetinis SRA3 popierius', 'price': 3.2, 'aliases': []},
- {'code': '1103', 'name': 'Instant glue', 'price': 3.5, 'aliases': []},
- {'code': '1109', 'name': 'Dvipuse lipni juosta', 'price': 7.5, 'aliases': []},
- {'code': '1113', 'name': 'Standard pencil', 'price': 1.5, 'aliases': []},
- {'code': '1117', 'name': 'Korteleboard box', 'price': 2.9, 'aliases': []},
- {'code': '1118', 'name': 'Automatic pen', 'price': 2.5, 'aliases': []},
- {'code': '1120', 'name': 'Wide-format tube, narrow', 'price': 3.0, 'aliases': []},
- {'code': '1124', 'name': 'Thick lipnus tape', 'price': 5.0, 'aliases': []},
- {'code': '1137', 'name': 'Colouraudona push pins', 'price': 1.5, 'aliases': []},
- {'code': '1144', 'name': 'Staples 24/6', 'price': 2.5, 'aliases': []},
- {'code': '1149', 'name': 'A4 remelis', 'price': 10.0, 'aliases': []},
- {'code': '1153', 'name': 'A4 remelis with thick border', 'price': 10.0, 'aliases': []},
- {'code': '1164', 'name': 'Popierius clips', 'price': 2.0, 'aliases': []},
- {'code': '1173', 'name': 'Mounting squares', 'price': 7.5, 'aliases': []},
- {'code': '1182', 'name': 'Popierius bags', 'price': 2.0, 'aliases': []},
- {'code': '1183', 'name': 'Brown kraft A4 vokas', 'price': 1.0, 'aliases': []},
- {'code': '1184', 'name': 'Pioneer Navigator A4 popieriaus pakuote', 'price': 7.5, 'aliases': []},
- {'code': '1214', 'name': 'Large spalvotaed lapai', 'price': 4.5, 'aliases': []},
- {'code': '1216', 'name': '40 × 60 (A2) arba 40 × 50 remelis', 'price': 28.0, 'aliases': []},
- {'code': '1219', 'name': '13 × 18 / A5 remelis', 'price': None, 'aliases': []},
- {'code': '1220', 'name': '15 × 21 (A5) remelis with thick border', 'price': 9.0, 'aliases': []},
- {'code': '1223', 'name': 'A3 remelis', 'price': 15.0, 'aliases': []},
- {'code': '1237', 'name': 'Staple remover', 'price': None, 'aliases': []},
- {'code': '1240', 'name': 'Small hole punch', 'price': 6.0, 'aliases': []},
- {'code': '1244', 'name': 'PVA glue', 'price': 3.0, 'aliases': []},
- {'code': '1245', 'name': 'Thin lipnus tape', 'price': 2.0, 'aliases': []},
- {'code': '1249', 'name': 'Correction fluid', 'price': 3.0, 'aliases': []},
- {'code': '1253', 'name': 'Pack of binder clips', 'price': 3.0, 'aliases': []},
- {'code': '1268', 'name': '16 GB USB atmintine', 'price': 20.0, 'aliases': []},
- {'code': '1270', 'name': 'KopijaPro pen', 'price': 2.0, 'aliases': []},
- {'code': '1274', 'name': 'Markers', 'price': 3.5, 'aliases': []},
- {'code': '1275', 'name': 'Adhesive tape with dispenser', 'price': 3.0, 'aliases': []},
- {'code': '1284', 'name': 'Postkorteles', 'price': 2.0, 'aliases': []},
- {'code': '1289', 'name': 'Binder clip', 'price': 0.5, 'aliases': []},
- {'code': '1293', 'name': '8 GB USB atmintine', 'price': 18.0, 'aliases': []},
- {'code': '1294', 'name': 'Padded vokas', 'price': None, 'aliases': []},
- {'code': '1296', 'name': 'Large hole punch', 'price': 15.0, 'aliases': []},
- {'code': '1300', 'name': 'Spausdinimaser cartridges', 'price': 1.0, 'aliases': []},
- {'code': '1301', 'name': 'Canvas', 'price': 1.0, 'aliases': []},
- {'code': '1302', 'name': 'Stamps', 'price': 1.0, 'aliases': []},
- {'code': '1303', 'name': 'Stamp rubber', 'price': 1.0, 'aliases': []},
- {'code': '1305', 'name': 'Window boxes', 'price': 5.5, 'aliases': []},
- {'code': '1317', 'name': 'Glossy A4 vokas', 'price': 3.5, 'aliases': []},
- {'code': '1318', 'name': 'Sticky notes', 'price': 1.5, 'aliases': []},
- {'code': '1319', 'name': 'A4 Curious Collection popierius', 'price': 2.0, 'aliases': []},
- {'code': '1327', 'name': 'Gift bags', 'price': 3.0, 'aliases': []},
- {'code': '1345', 'name': '32 GB USB atmintine', 'price': 22.0, 'aliases': []},
- {'code': '1349', 'name': 'Marker set', 'price': 4.0, 'aliases': []},
- {'code': '1350', 'name': 'Wide-format tube, wide', 'price': 4.5, 'aliases': []},
- {'code': '1351', 'name': '10 × 15 (A6) remelis', 'price': 5.0, 'aliases': []},
- {'code': '1354', 'name': 'Spausdinimasing on a bag', 'price': 8.0, 'aliases': []},
- {'code': '1355', 'name': 'Spausdinimasing on a T-shirt', 'price': 18.0, 'aliases': []},
- {'code': '1360', 'name': 'A0 remelis', 'price': 65.0, 'aliases': []},
- {'code': '1362', 'name': 'Teksturinis A5 vokas', 'price': 2.5, 'aliases': []},
- {'code': '1364', 'name': 'Pack of 20 document sleeves', 'price': 3.0, 'aliases': []},
- {'code': '1991', 'name': 'Jigsaw puzzle production (price varies by puzzle)', 'price': None, 'aliases': []},
- {'code': '1999', 'name': '10 × 15 foto spausdinimas', 'price': 0.6, 'aliases': []},
- {'code': '2000', 'name': 'A4 foto spausdinimas', 'price': 2.5, 'aliases': []},
- {'code': '2001', 'name': 'Document foto', 'price': 5.0, 'aliases': []},
- {'code': '2003', 'name': 'Spausdinimasing on a mug', 'price': 1.0, 'aliases': []},
- {'code': '2006', 'name': '60 × 90 remelis', 'price': 30.0, 'aliases': []},
- {'code': '2007', 'name': '50 × 70 remelis', 'price': 28.0, 'aliases': []},
- {'code': '2009', 'name': 'Satin ribbon', 'price': 5.0, 'aliases': []},
- {'code': '2012', 'name': 'A1 remelis', 'price': 32.0, 'aliases': []},
- {'code': '2022', 'name': 'A3 skaidre', 'price': 3.0, 'aliases': []},
- {'code': '2025', 'name': 'Large blizgus spalvotaed lapai', 'price': 4.0, 'aliases': []},
- {'code': '2029', 'name': 'Gift ribbon', 'price': 2.5, 'aliases': []},
- {'code': '2032', 'name': 'Memo note lapai', 'price': 5.0, 'aliases': []},
- {'code': '2033', 'name': 'A5/A6 information holder', 'price': 6.5, 'aliases': []},
- {'code': '2034', 'name': 'A4 information holder', 'price': 10.0, 'aliases': []},
- {'code': '2047', 'name': 'Skaidrus bags, 100 pcs', 'price': 8.0, 'aliases': []},
- {'code': '2052', 'name': 'Adhesive ribbon', 'price': 2.0, 'aliases': []},
- {'code': '2054', 'name': '64 GB USB atmintine', 'price': 26.0, 'aliases': []},
- {'code': '2059', 'name': 'Small calendars', 'price': 1.0, 'aliases': []},
- {'code': '2062', 'name': 'Navigator popierius, 150 lapai', 'price': 3.0, 'aliases': []},
- {'code': '2070', 'name': 'KopijaPro A6 / 14 × 18 vokass', 'price': 2.5, 'aliases': []},
- {'code': '2074', 'name': 'Decorative elements', 'price': 5.0, 'aliases': []},
- {'code': '2079', 'name': 'KopijaPro C65 vokass', 'price': 2.5, 'aliases': []},
- {'code': '2080', 'name': 'KopijaPro A5 vokass', 'price': 3.5, 'aliases': []},
- {'code': '2081', 'name': 'KopijaPro A4 vokass', 'price': 4.5, 'aliases': []},
- {'code': '2088', 'name': 'A0 remelis backing board', 'price': 24.0, 'aliases': []},
- {'code': '2089', 'name': 'A1 remelis backing board', 'price': 12.0, 'aliases': []},
- {'code': '2090', 'name': 'A2 remelis backing board', 'price': 6.0, 'aliases': []},
- {'code': '2091', 'name': 'A3 remelis backing board', 'price': 3.0, 'aliases': []},
- {'code': '2851', 'name': 'SRA3 transfer popierius, 350 gsm', 'price': 3.1, 'aliases': []},
- {'code': '3008', 'name': 'Vatmanas 90×64 cm (240 gsm)', 'price': 3.0, 'aliases': []},
- {'code': '3009', 'name': 'Spausdinimas ant vatmano', 'price': 14.0, 'aliases': []},
- {'code': '4800', 'name': '80 gsm paprastas / brėžinys', 'price': 0.95, 'aliases': []},
- {'code': '4810', 'name': '80 gsm paprastas / tekstas+pav.', 'price': 1.4, 'aliases': []},
- {'code': '4820', 'name': '80 gsm paprastas / paveikslas', 'price': 1.6, 'aliases': []},
- {'code': '4830', 'name': '120 gsm storesnis / tekstas+pav.', 'price': 1.7, 'aliases': []},
- {'code': '4840', 'name': '120 gsm storesnis / paveikslas', 'price': 2.1, 'aliases': []},
- {'code': '4850', 'name': '180 gsm storas / tekstas+paveikslas', 'price': 2.4, 'aliases': []},
- {'code': '4860', 'name': '180 gsm storas / paveikslas', 'price': 2.55, 'aliases': []},
- {'code': '4893', 'name': 'Satin / fotopopierius / paveikslas', 'price': 3.2, 'aliases': []},
- {'code': '4894', 'name': 'Satin / fotopopierius / tekstas+pav.', 'price': 2.8, 'aliases': []},
- {'code': '4900', 'name': 'Natūrali drobė', 'price': 3.3, 'aliases': []},
- {'code': '4902', 'name': 'Ple vele plėvelė / tekstas+paveikslas', 'price': 2.9, 'aliases': []},
- {'code': '4903', 'name': 'Ple vele plėvelė / paveikslas', 'price': 3.3, 'aliases': []},
- {'code': '4908', 'name': 'Lipdukas PVC / tekstas+paveikslas', 'price': 3.0, 'aliases': []},
- {'code': '4909', 'name': 'Lipdukas PVC / paveikslas', 'price': 3.2, 'aliases': []},
- {'code': '4910', 'name': 'Kalkė / brėžinys', 'price': 1.7, 'aliases': []},
- {'code': '4911', 'name': 'Kalkė / tekstas+paveikslas', 'price': 2.2, 'aliases': []},
- {'code': '4912', 'name': 'Kalkė / paveikslas', 'price': 2.5, 'aliases': []},
- {'code': '4913', 'name': '140 gsm storas / tekstas+paveikslas', 'price': 2.35, 'aliases': []},
- {'code': '4914', 'name': '140 gsm storas / paveikslas', 'price': 2.3, 'aliases': []},
- {'code': '4915', 'name': 'Sintetinė drobė', 'price': 2.8, 'aliases': []},
- {'code': '4916', 'name': 'Karštas laminatas', 'price': 1.8, 'aliases': []},
- {'code': '4917', 'name': 'Magnetinė plėvelė', 'price': 2.5, 'aliases': []},
- {'code': '8800', 'name': 'Reirisimo', 'price': 5.0, 'aliases': []},
- {'code': '9302', 'name': 'Plotting', 'price': 1.0, 'aliases': []},
- {'code': '9310', 'name': 'Cup/trophy item', 'price': 1.0, 'aliases': []},
- {'code': '9311', 'name': 'Medals', 'price': 1.0, 'aliases': []},
- {'code': '9312', 'name': 'One-sided vizitines korteles maketavimas', 'price': 25.0, 'aliases': []},
- {'code': '9313', 'name': 'Double-sided vizitines korteles maketavimas', 'price': 35.0, 'aliases': []},
- {'code': '9314', 'name': 'Badge production', 'price': 3.0, 'aliases': []},
- {'code': '9315', 'name': 'Keychain production', 'price': 3.0, 'aliases': []},
- {'code': '9316', 'name': 'Magnet production', 'price': 2.0, 'aliases': []},
- {'code': '9400', 'name': 'Notarial thread', 'price': 0.7, 'aliases': []},
- {'code': '9502', 'name': '80 gsm A4 popierius', 'price': 0.15, 'aliases': []},
- {'code': '9503', 'name': 'A4 self-service popierius, one lapas', 'price': 0.06, 'aliases': []},
- {'code': '9504', 'name': '80 gsm popieriaus pakuote', 'price': 5.5, 'aliases': []},
- {'code': '9512', 'name': '80 gsm A3 popierius', 'price': 0.2, 'aliases': []},
- {'code': '9513', 'name': 'A3 self-service popierius, one lapas', 'price': 0.07, 'aliases': []},
- {'code': '9582', 'name': 'A4 transfer popierius', 'price': 1.0, 'aliases': []},
- {'code': '9592', 'name': 'A3 transfer popierius', 'price': 1.5, 'aliases': []},
- {'code': '9822', 'name': '160 gsm A4 popierius', 'price': 0.5, 'aliases': []},
- {'code': '9832', 'name': '160 gsm A3 popierius', 'price': 0.8, 'aliases': []},
- {'code': '9842', 'name': '200 gsm A4 popierius', 'price': 0.65, 'aliases': []},
- {'code': '9852', 'name': '200 gsm A3 popierius', 'price': 0.95, 'aliases': []},
- {'code': '9862', 'name': '250–300 gsm A4 popierius', 'price': 1.1, 'aliases': []},
- {'code': '9872', 'name': '250–300 gsm A3 popierius', 'price': 2.1, 'aliases': []},
- {'code': '9922', 'name': 'A4 lipnus popierius', 'price': 1.5, 'aliases': []},
- {'code': '9972', 'name': '120 gsm A4 popierius', 'price': 0.4, 'aliases': []},
- {'code': '9982', 'name': '120 gsm A3 popierius', 'price': 0.6, 'aliases': []},
- {'code': '1999x2', 'name': 'A5 foto spausdinimas', 'price': 1.2, 'aliases': []}]
-_EMBEDDED_PAPER_SIZES = [{'name': 'A0', 'width_mm': 841, 'height_mm': 1189, 'custom': False},
- {'name': 'A1', 'width_mm': 594, 'height_mm': 841, 'custom': False},
- {'name': 'A2', 'width_mm': 420, 'height_mm': 594, 'custom': False},
- {'name': 'A3', 'width_mm': 297, 'height_mm': 420, 'custom': False},
- {'name': 'A4', 'width_mm': 210, 'height_mm': 297, 'custom': False},
- {'name': 'A5', 'width_mm': 148, 'height_mm': 210, 'custom': False},
- {'name': 'A6', 'width_mm': 105, 'height_mm': 148, 'custom': False},
- {'name': 'A7', 'width_mm': 74, 'height_mm': 105, 'custom': False},
- {'name': 'SRA3', 'width_mm': 320, 'height_mm': 450, 'custom': False},
- {'name': 'SRA4', 'width_mm': 225, 'height_mm': 320, 'custom': False},
- {'name': '10×15 cm (102×152)', 'width_mm': 102, 'height_mm': 152, 'custom': False},
- {'name': '21×15 cm (210×152)', 'width_mm': 210, 'height_mm': 152, 'custom': False},
- {'name': 'Square 10×10', 'width_mm': 100, 'height_mm': 100, 'custom': False},
- {'name': 'Square 15×15', 'width_mm': 150, 'height_mm': 150, 'custom': False}]
-_EMBEDDED_WIDE_ITEMS = [{'code': '4800', 'name': '80 gsm paprastas / brėžinys', 'price': 0.95, 'coverage': 'drawing'},
- {'code': '4810', 'name': '80 gsm paprastas / tekstas+pav.', 'price': 1.4, 'coverage': 'partial'},
- {'code': '4820', 'name': '80 gsm paprastas / paveikslas', 'price': 1.6, 'coverage': 'full'},
- {'code': '4830', 'name': '120 gsm storesnis / tekstas+pav.', 'price': 1.7, 'coverage': 'partial'},
- {'code': '4840', 'name': '120 gsm storesnis / paveikslas', 'price': 2.1, 'coverage': 'full'},
- {'code': '4913', 'name': '140 gsm storas / tekstas+paveikslas', 'price': 2.35, 'coverage': 'partial'},
- {'code': '4914', 'name': '140 gsm storas / paveikslas', 'price': 2.3, 'coverage': 'full'},
- {'code': '4850', 'name': '180 gsm storas / tekstas+paveikslas', 'price': 2.4, 'coverage': 'partial'},
- {'code': '4860', 'name': '180 gsm storas / paveikslas', 'price': 2.55, 'coverage': 'full'},
- {'code': '4894', 'name': 'Satin / fotopopierius / tekstas+pav.', 'price': 2.8, 'coverage': 'partial'},
- {'code': '4893', 'name': 'Satin / fotopopierius / paveikslas', 'price': 3.2, 'coverage': 'full'},
- {'code': '4915', 'name': 'Sintetinė drobė', 'price': 2.8, 'coverage': 'fixed'},
- {'code': '4900', 'name': 'Natūrali drobė', 'price': 3.3, 'coverage': 'fixed'},
- {'code': '4902', 'name': 'Film plėvelė / tekstas+paveikslas', 'price': 2.9, 'coverage': 'partial'},
- {'code': '4903', 'name': 'Film plėvelė / paveikslas', 'price': 3.3, 'coverage': 'full'},
- {'code': '4908', 'name': 'Lipdukas PVC / tekstas+paveikslas', 'price': 3.0, 'coverage': 'partial'},
- {'code': '4909', 'name': 'Lipdukas PVC / paveikslas', 'price': 3.2, 'coverage': 'full'},
- {'code': '4910', 'name': 'Kalkė / brėžinys', 'price': 1.7, 'coverage': 'drawing'},
- {'code': '4911', 'name': 'Kalkė / tekstas+paveikslas', 'price': 2.2, 'coverage': 'partial'},
- {'code': '4912', 'name': 'Kalkė / paveikslas', 'price': 2.5, 'coverage': 'full'},
- {'code': '3009', 'name': 'Spausdinimas ant vatmano', 'price': 14.0, 'coverage': 'fixed'},
- {'code': '4916', 'name': 'Karštas laminatas', 'price': 1.8, 'coverage': 'fixed'},
- {'code': '4917', 'name': 'Magnetinė plėvelė', 'price': 2.5, 'coverage': 'fixed'},
- {'code': '3008', 'name': 'Vatmanas 90×64 cm (240 gsm)', 'price': 3.0, 'coverage': 'fixed'}]
 
 def _editable_paths():
     settings=load_app_settings()
@@ -4125,38 +4403,244 @@ def _write_sizes_workbook(path, rows):
     for row in rows: ws.append([row.get(field,"") for field in fields])
     wb.save(path)
 
+def _bundled_codes_file():
+    direct = resource_path("copypro_kodai.xlsx")
+    if os.path.isfile(direct):
+        return direct
+    nested = resource_path(os.path.join("data", "copypro_kodai.xlsx"))
+    return nested if os.path.isfile(nested) else None
+
+
+def _safe_version_for_filename(value):
+    return "".join(
+        ch if ch.isalnum() or ch in ("-", "_", ".") else "_"
+        for ch in str(value or "unknown")
+    )
+
+
+def sync_code_workbook_after_app_update():
+    """
+    Replace only the active item-code workbook once per application version.
+
+    The previous workbook is backed up to:
+        %APPDATA%\\CopyPro\\backups\\
+
+    The paper-size workbook is intentionally never replaced here.
+    """
+    bundled = _bundled_codes_file()
+    if not bundled:
+        return {
+            "updated": False,
+            "reason": "No bundled code workbook was found.",
+        }
+
+    settings = load_app_settings()
+    installed_version = str(current_version()).strip() or "0.0.0"
+    previous_data_version = str(
+        settings.get("codes_workbook_app_version", "")
+    ).strip()
+
+    # Run exactly once for each installed application version.
+    if previous_data_version == installed_version:
+        return {
+            "updated": False,
+            "reason": "Code workbook already synced for this version.",
+        }
+
+    active_path = os.path.abspath(
+        settings.get("codes_file", DEFAULT_CODES_FILE)
+    )
+    os.makedirs(os.path.dirname(active_path), exist_ok=True)
+
+    backup_path = None
+    if os.path.isfile(active_path):
+        timestamp = __import__("datetime").datetime.now().strftime(
+            "%Y-%m-%d_%H-%M-%S"
+        )
+        old_version = _safe_version_for_filename(
+            previous_data_version or "before_first_sync"
+        )
+        extension = os.path.splitext(active_path)[1] or ".xlsx"
+        backup_name = (
+            f"copypro_kodai_{old_version}_{timestamp}{extension}"
+        )
+        backup_path = os.path.join(BACKUPS_DIR, backup_name)
+        shutil.copy2(active_path, backup_path)
+
+    temporary_path = active_path + ".updating"
+    try:
+        shutil.copy2(bundled, temporary_path)
+        os.replace(temporary_path, active_path)
+    except Exception:
+        try:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        except Exception:
+            pass
+        raise
+
+    settings["codes_file"] = active_path
+    settings["codes_workbook_app_version"] = installed_version
+    save_app_settings(settings)
+
+    return {
+        "updated": True,
+        "version": installed_version,
+        "codes_file": active_path,
+        "backup_file": backup_path,
+    }
+
+
 def _ensure_editable_files():
     paths=_editable_paths()
     _copy_default_if_missing(paths["codes_file"],"copypro_kodai.xlsx")
     _copy_default_if_missing(paths["paper_sizes_file"],"copypro_popieriaus_dydziai.xlsx")
 
 def reload_editable_data():
+    """Reload all product and paper data exclusively from the active Excel files."""
     global PAPER_SIZES_MM, WIDE_FORMAT_ITEMS, WIDE_FORMAT_ORDER, PLU_SEARCH_ALIASES
-    _ensure_editable_files(); paths=_editable_paths()
-    PLU_DESCRIPTIONS.clear(); PLU_PRICES.clear(); WIDE_FORMAT_ITEMS={}; WIDE_FORMAT_ORDER=[]; PLU_SEARCH_ALIASES={}
-    coverage_to_internal={"dalinis":"partial","pilnas":"full","brėžinys":"drawing","brezinys":"drawing","fiksuotas":"fixed"}
-    for item in _data_rows(paths["codes_file"],"Items"):
-        if str(item.get("active","taip")).strip().lower() not in ("taip","yes","1","true"): continue
-        code=str(item.get("code","")).strip(); name=str(item.get("name_lt","")).strip()
-        if not code or not name: continue
-        PLU_DESCRIPTIONS[code]=name
-        PLU_SEARCH_ALIASES[code]=str(item.get("search_aliases_lt","")).strip()
-        raw=str(item.get("price_eur","")).strip().replace(",",".")
-        if raw:
-            try: PLU_PRICES[code]=float(raw)
-            except ValueError: pass
-        raw_coverage=str(item.get("wide_format_coverage","")).strip().lower()
-        coverage=coverage_to_internal.get(raw_coverage,raw_coverage)
-        label=str(item.get("wide_format_label_lt","")).strip()
+
+    _ensure_editable_files()
+    paths = _editable_paths()
+
+    codes_path = os.path.abspath(paths["codes_file"])
+    sizes_path = os.path.abspath(paths["paper_sizes_file"])
+
+    if not os.path.isfile(codes_path):
+        raise FileNotFoundError(f"Code list Excel file was not found:\n{codes_path}")
+    if not os.path.isfile(sizes_path):
+        raise FileNotFoundError(f"Paper-size Excel file was not found:\n{sizes_path}")
+
+    code_rows = _data_rows(codes_path, "Items")
+    size_rows = _data_rows(sizes_path, "Sizes")
+
+    required_code_columns = {
+        "code", "name_lt", "price_eur", "active",
+        "search_aliases_lt", "wide_format_coverage", "wide_format_label_lt",
+    }
+    required_size_columns = {
+        "name", "width_mm", "height_mm", "active", "is_custom",
+    }
+
+    if code_rows:
+        missing = required_code_columns.difference(code_rows[0].keys())
+        if missing:
+            raise ValueError(
+                "The Items sheet is missing required columns: "
+                + ", ".join(sorted(missing))
+            )
+    else:
+        raise ValueError(f"The Items sheet contains no data:\n{codes_path}")
+
+    if size_rows:
+        missing = required_size_columns.difference(size_rows[0].keys())
+        if missing:
+            raise ValueError(
+                "The Sizes sheet is missing required columns: "
+                + ", ".join(sorted(missing))
+            )
+    else:
+        raise ValueError(f"The Sizes sheet contains no data:\n{sizes_path}")
+
+    new_descriptions = {}
+    new_prices = {}
+    new_aliases = {}
+    new_wide_items = {}
+    new_wide_order = []
+
+    coverage_to_internal = {
+        "dalinis": "partial",
+        "pilnas": "full",
+        "brėžinys": "drawing",
+        "brezinys": "drawing",
+        "fiksuotas": "fixed",
+        "partial": "partial",
+        "full": "full",
+        "drawing": "drawing",
+        "fixed": "fixed",
+    }
+
+    for item in code_rows:
+        if str(item.get("active", "taip")).strip().lower() not in (
+            "taip", "yes", "1", "true"
+        ):
+            continue
+
+        code = str(item.get("code", "")).strip()
+        name = str(item.get("name_lt", "")).strip()
+        if not code or not name:
+            continue
+
+        new_descriptions[code] = name
+        new_aliases[code] = str(item.get("search_aliases_lt", "")).strip()
+
+        raw_price = str(item.get("price_eur", "")).strip().replace(",", ".")
+        if raw_price:
+            try:
+                new_prices[code] = float(raw_price)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid price for code {code}: {item.get('price_eur')}"
+                )
+
+        raw_coverage = str(
+            item.get("wide_format_coverage", "")
+        ).strip().lower()
+        coverage = coverage_to_internal.get(raw_coverage, raw_coverage)
+        label = str(item.get("wide_format_label_lt", "")).strip()
+
+        # Wide-format order is exactly the top-to-bottom row order in Excel.
         if coverage:
-            WIDE_FORMAT_ITEMS[code]=(name,PLU_PRICES.get(code,0.0),coverage,label or name)
-            WIDE_FORMAT_ORDER.append(code)
-    PAPER_SIZES_MM={}
-    for item in _data_rows(paths["paper_sizes_file"],"Sizes"):
-        if str(item.get("active","taip")).strip().lower() not in ("taip","yes","1","true"): continue
-        if str(item.get("is_custom","ne")).strip().lower() in ("taip","yes","1","true"): continue
-        try: PAPER_SIZES_MM[str(item["name"]).strip()]=(float(str(item["width_mm"]).replace(",",".")),float(str(item["height_mm"]).replace(",",".")))
-        except Exception: continue
+            new_wide_items[code] = (
+                name,
+                new_prices.get(code, 0.0),
+                coverage,
+                label or name,
+            )
+            new_wide_order.append(code)
+
+    new_paper_sizes = {}
+    for item in size_rows:
+        if str(item.get("active", "taip")).strip().lower() not in (
+            "taip", "yes", "1", "true"
+        ):
+            continue
+        if str(item.get("is_custom", "ne")).strip().lower() in (
+            "taip", "yes", "1", "true"
+        ):
+            continue
+
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+
+        try:
+            width = float(str(item.get("width_mm", "")).replace(",", "."))
+            height = float(str(item.get("height_mm", "")).replace(",", "."))
+        except ValueError:
+            raise ValueError(f"Invalid paper size dimensions for {name}")
+
+        new_paper_sizes[name] = (width, height)
+
+    # Replace live data only after both workbooks have loaded successfully.
+    PLU_DESCRIPTIONS.clear()
+    PLU_DESCRIPTIONS.update(new_descriptions)
+
+    PLU_PRICES.clear()
+    PLU_PRICES.update(new_prices)
+
+    PLU_SEARCH_ALIASES = new_aliases
+    WIDE_FORMAT_ITEMS = new_wide_items
+    WIDE_FORMAT_ORDER = new_wide_order
+    PAPER_SIZES_MM = new_paper_sizes
+
+    return {
+        "codes_file": codes_path,
+        "paper_sizes_file": sizes_path,
+        "code_count": len(PLU_DESCRIPTIONS),
+        "wide_format_count": len(WIDE_FORMAT_ORDER),
+        "paper_size_count": len(PAPER_SIZES_MM),
+    }
 
 def load_custom_sizes():
     try:
@@ -4179,7 +4663,18 @@ def save_custom_sizes(sizes_dict):
         with open(path,"w",encoding="utf-8-sig",newline="") as f:
             writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader();writer.writerows(rows)
 
-reload_editable_data()
+try:
+    CODE_SYNC_RESULT = sync_code_workbook_after_app_update()
+    reload_editable_data()
+except Exception as _data_load_error:
+    # Store the error so the UI can show it after Tk has started.
+    CODE_SYNC_RESULT = {
+        "updated": False,
+        "reason": str(_data_load_error),
+    }
+    DATA_LOAD_ERROR = str(_data_load_error)
+else:
+    DATA_LOAD_ERROR = None
 
 def get_plu_description(code):
     return PLU_DESCRIPTIONS.get(str(code).strip(), "")
@@ -4209,6 +4704,17 @@ class PrintCounterTab(tk.Frame):
         self.active_row = None
         self.search_codes = []
         self._build()
+
+    def on_show(self):
+        try:
+            reload_editable_data()
+            self._update_search_results()
+        except Exception as ex:
+            messagebox.showerror(
+                "Excel data error",
+                f"Could not reload the active Excel files.\n\n{ex}",
+                parent=self,
+            )
 
     def _build(self):
         toolbar = tk.Frame(self, bg=SURFACE, pady=8)
@@ -4588,6 +5094,16 @@ class PrintCounterTab(tk.Frame):
 
 
     def _open_wide_format_quote(self):
+        try:
+            reload_editable_data()
+        except Exception as ex:
+            messagebox.showerror(
+                "Excel data error",
+                f"Could not reload the active code workbook.\n\n{ex}",
+                parent=self,
+            )
+            return
+
         popup = tk.Toplevel(self)
         popup.title("Wide format quote")
         popup.configure(bg=BG)
@@ -5253,6 +5769,34 @@ class CopyProApp(dnd.Tk if HAS_DND else tk.Tk):
         self.minsize(920,620)
         self.configure(bg=BG)
         self._style(); self._build()
+        if DATA_LOAD_ERROR:
+            self.after(
+                300,
+                lambda: messagebox.showerror(
+                    "Excel data error",
+                    "CopyPro Tools could not load its active Excel data files.\n\n"
+                    + DATA_LOAD_ERROR
+                    + "\n\nOpen Settings and select the correct workbooks.",
+                    parent=self,
+                ),
+            )
+        elif CODE_SYNC_RESULT.get("updated"):
+            backup = CODE_SYNC_RESULT.get("backup_file")
+            message = (
+                "Prekių ir paslaugų kodų Excel failas buvo atnaujintas "
+                f"į programos versiją {CODE_SYNC_RESULT.get('version')}.\n\n"
+                f"Naujas failas:\n{CODE_SYNC_RESULT.get('codes_file')}"
+            )
+            if backup:
+                message += f"\n\nSeno failo atsarginė kopija:\n{backup}"
+            self.after(
+                350,
+                lambda m=message: messagebox.showinfo(
+                    "Kodų sąrašas atnaujintas",
+                    m,
+                    parent=self,
+                ),
+            )
         self.after(1800, lambda: self._check_for_updates(manual=False))
 
     def _style(self):
@@ -5350,6 +5894,53 @@ class CopyProApp(dnd.Tk if HAS_DND else tk.Tk):
 
         check_for_update_async(finished)
 
+    def _diagnostic_snapshot(self):
+        layout=self.tabs.get("layout") if hasattr(self,"tabs") else None
+        scan=self.tabs.get("scan") if hasattr(self,"tabs") else None
+        cache=getattr(layout,"_preview_item_cache",None)
+        tk_images=0
+        try:tk_images=len(self.tk.call("image","names"))
+        except Exception:pass
+        return {
+            "ram":process_memory_mb(),
+            "cache_mb":getattr(cache,"current_bytes",0)/(1024*1024),
+            "cache_items":len(cache) if cache is not None else 0,
+            "layout_sources":len(getattr(layout,"files",[])) if layout else 0,
+            "preview_images":len(getattr(layout,"preview_images",[])) if layout else 0,
+            "preview_job":bool(getattr(layout,"_preview_job",None)) if layout else False,
+            "scan_pages":len(getattr(scan,"pages",[])) if scan else 0,
+            "tk_images":tk_images,
+        }
+
+    def _clear_all_preview_caches(self):
+        for tab in self.tabs.values():
+            if hasattr(tab,"clear_memory_cache"):
+                try:tab.clear_memory_cache()
+                except Exception:pass
+        gc.collect()
+
+    def _open_diagnostics(self):
+        popup=tk.Toplevel(self); popup.title("CopyPro diagnostics"); popup.configure(bg=BG); popup.geometry("470x350"); popup.resizable(False,False)
+        lbl(popup,"MEMORY & PREVIEW DIAGNOSTICS",11,TEXT,True,bg=BG).pack(anchor="w",padx=18,pady=(16,8))
+        output=tk.Label(popup,bg=SURFACE,fg=TEXT,font=("Consolas",10),justify="left",anchor="nw",padx=14,pady=12); output.pack(fill="both",expand=True,padx=18,pady=(0,10))
+        def refresh():
+            if not popup.winfo_exists():return
+            data=self._diagnostic_snapshot()
+            output.config(text=(
+                f"Current RAM:            {data['ram']:.1f} MB\n"
+                f"Print preview cache:    {data['cache_mb']:.1f} MB / 128 MB\n"
+                f"Cached preview items:   {data['cache_items']}\n"
+                f"Loaded layout sources:  {data['layout_sources']}\n"
+                f"Displayed sheet images: {data['preview_images']}\n"
+                f"Preview refresh queued: {'yes' if data['preview_job'] else 'no'}\n"
+                f"Scan pages loaded:       {data['scan_pages']}\n"
+                f"Tk image objects:        {data['tk_images']}\n"
+            ))
+            popup.after(1000,refresh)
+        footer=tk.Frame(popup,bg=BG); footer.pack(fill="x",padx=18,pady=(0,14))
+        styled_btn(footer,"Clear preview caches",self._clear_all_preview_caches,style="secondary").pack(side="left")
+        styled_btn(footer,"Close",popup.destroy).pack(side="right"); refresh()
+
     def _open_data_settings(self):
         popup=tk.Toplevel(self); popup.title("Duomenu failu nustatymai"); popup.configure(bg=BG); popup.geometry("690x300"); popup.grab_set()
         paths=_editable_paths(); vars_={k:tk.StringVar(value=v) for k,v in paths.items()}
@@ -5368,14 +5959,25 @@ class CopyProApp(dnd.Tk if HAS_DND else tk.Tk):
         def save_reload():
             data=load_app_settings(); data.update({k:v.get().strip() for k,v in vars_.items()}); save_app_settings(data)
             try:
-                reload_editable_data()
+                result=reload_editable_data()
                 for tab in self.tabs.values():
                     if hasattr(tab,"on_show"): tab.on_show()
-                messagebox.showinfo("Issaugota","Failu vietos issaugotos ir duomenys perkrauti.",parent=popup); popup.destroy()
+                messagebox.showinfo(
+                    "Išsaugota",
+                    "Duomenys įkelti tik iš šių Excel failų:\n\n"
+                    f"Kodai: {result['codes_file']}\n"
+                    f"Popieriaus dydžiai: {result['paper_sizes_file']}\n\n"
+                    f"Kodų: {result['code_count']}\n"
+                    f"Plataus formato eilučių: {result['wide_format_count']}\n"
+                    f"Popieriaus dydžių: {result['paper_size_count']}",
+                    parent=popup,
+                )
+                popup.destroy()
             except Exception as ex: messagebox.showerror("Klaida",str(ex),parent=popup)
         footer=tk.Frame(popup,bg=BG); footer.pack(fill="x",padx=18,pady=14)
         styled_btn(footer,"Atidaryti AppData aplanka",lambda:subprocess.Popen(["explorer",COPYPRO_DATA_DIR]) if sys.platform.startswith("win") else None,style="secondary").pack(side="left")
         styled_btn(footer,"Tikrinti atnaujinimus",lambda:self._check_for_updates(manual=True),style="secondary").pack(side="left",padx=8)
+        styled_btn(footer,"Diagnostika",self._open_diagnostics,style="secondary").pack(side="left")
         lbl(footer,f"v{current_version()}",8,MUTED,bg=BG).pack(side="left",padx=4)
         styled_btn(footer,"Išsaugoti",save_reload,style="success").pack(side="right")
 
@@ -5392,6 +5994,8 @@ class CopyProApp(dnd.Tk if HAS_DND else tk.Tk):
             ("resizer",   "📐  Bulk Resizer",       ResizerTab),
             ("converter", "🔄  File Converter",     ConverterTab),
             ("layout",    "🗂  Print Layout",       PrintLayoutTab),
+            ("polaroid",  "▧  Polaroid Maker",     PolaroidMakerTab),
+            ("scan",      "▣  Scan Crop",          ScanCroppingTab),
             ("cutline",   "✂  Sticker Outline",    StickerCutlineTab),
             ("pdf",       "📄  PDF Optimiser",      PdfToolsTab),
             ("pages",     "📊  Page Counter",       PageCounterTab),
@@ -5407,6 +6011,8 @@ class CopyProApp(dnd.Tk if HAS_DND else tk.Tk):
             "resizer": IMAGE_EXTS | {".pdf"},
             "converter": None,
             "layout": IMAGE_EXTS | {".pdf"},
+            "polaroid": IMAGE_EXTS | {".pdf"},
+            "scan": {".pdf"},
             "cutline": IMAGE_EXTS | {".pdf"},
             "pdf": {".pdf"},
             "pages": {".pdf"},

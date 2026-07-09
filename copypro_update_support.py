@@ -229,17 +229,42 @@ def check_for_update_async(callback) -> None:
 
 
 def launch_updater(release: dict[str, Any]) -> None:
+    """
+    Start only the external updater with administrator permission.
+
+    CopyPro Tools itself remains non-elevated so Windows Explorer drag-and-drop
+    continues to work normally.
+    """
     if not (IS_WINDOWS and IS_FROZEN):
         raise RuntimeError("Automatic updating is available in the compiled Windows build only.")
+
     updater = ensure_external_updater()
     if updater is None:
-        raise FileNotFoundError("CopyPro Updater.exe was not found. Build the release with the updater included.")
-    command = [
-        str(updater),
+        raise FileNotFoundError(
+            "CopyPro Updater.exe was not found. Build the release with the updater included."
+        )
+
+    arguments = [
         "--pid", str(os.getpid()),
         "--url", str(release["download_url"]),
         "--app-dir", str(INSTALL_DIR),
         "--exe-name", Path(sys.executable).name,
         "--version", str(release["version"]),
     ]
-    subprocess.Popen(command, cwd=str(UPDATER_DIR))
+
+    # ShellExecuteW with the "runas" verb displays the Windows UAC prompt.
+    import ctypes
+
+    parameters = subprocess.list2cmdline(arguments)
+    result = ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "runas",
+        str(updater),
+        parameters,
+        str(UPDATER_DIR),
+        1,
+    )
+    if int(result) <= 32:
+        raise PermissionError(
+            "Administrator permission was not granted, so the update could not start."
+        )
