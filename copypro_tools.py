@@ -1981,10 +1981,14 @@ class StickerCutlineTab(tk.Frame, DropMixin):
         self.include_holes_var = tk.BooleanVar(value=False)
         self.dpi_var = tk.DoubleVar(value=300.0)
         self.line_width_var = tk.DoubleVar(value=0.25)
+        self.smoothness_var = tk.IntVar(value=30)
+        self.detail_var = tk.IntVar(value=35)
 
         self._add_scale(controls, "White tolerance", self.tolerance_var, 0, 80, 1)
         self._add_scale(controls, "Minimum object area (%)", self.min_area_var, 0, 5, 0.05)
         self._add_scale(controls, "Outline offset (mm)", self.offset_var, -3, 10, 0.1)
+        self._add_scale(controls, "Smoothness", self.smoothness_var, 0, 100, 1)
+        self._add_scale(controls, "Path detail / point reduction", self.detail_var, 0, 100, 1)
 
         row = tk.Frame(controls, bg=SURFACE)
         row.pack(fill="x", padx=16, pady=(5, 3))
@@ -2223,6 +2227,23 @@ class StickerCutlineTab(tk.Frame, DropMixin):
                 pass
         self._analysis_job = self.after(180, self._analyse)
 
+    @staticmethod
+    def _corner_preserving_smooth(points,amount):
+        pts=np.asarray(points,dtype=np.float32)
+        if len(pts)<5 or amount<=0:return pts
+        passes=max(1,int(round(amount/25)))
+        strength=min(.45,amount/100*.45)
+        for _ in range(passes):
+            previous=np.roll(pts,1,axis=0); following=np.roll(pts,-1,axis=0)
+            a=previous-pts; b=following-pts
+            denom=np.linalg.norm(a,axis=1)*np.linalg.norm(b,axis=1)+1e-6
+            angle=np.degrees(np.arccos(np.clip(np.sum(a*b,axis=1)/denom,-1,1)))
+            # Small interior angle means an important sharp corner: keep it fixed.
+            movable=angle>125
+            averaged=(previous+pts*2+following)/4
+            pts[movable]=pts[movable]*(1-strength)+averaged[movable]*strength
+        return pts
+
     def _analyse(self):
         self._analysis_job = None
         if self.analysis_image is None:
@@ -2256,7 +2277,8 @@ class StickerCutlineTab(tk.Frame, DropMixin):
             retrieval = cv2.RETR_TREE if self.include_holes_var.get() else cv2.RETR_EXTERNAL
             contours, hierarchy = cv2.findContours(mask, retrieval, cv2.CHAIN_APPROX_NONE)
             min_area = image.width * image.height * max(0.0, float(self.min_area_var.get())) / 100.0
-            smooth = 0.0
+            smoothness=max(0,min(100,int(self.smoothness_var.get())))
+            detail=max(0,min(100,int(self.detail_var.get())))
 
             result = []
             for index, contour in enumerate(contours):
@@ -2267,16 +2289,19 @@ class StickerCutlineTab(tk.Frame, DropMixin):
                     # Keep outer paths and meaningful inner holes. Tiny holes are
                     # already removed by the area threshold above.
                     pass
-                perimeter = cv2.arcLength(contour, True)
-                epsilon = perimeter * smooth
-                approx = cv2.approxPolyDP(contour, epsilon, True) if epsilon > 0 else contour
-                points = [(float(p[0][0]), float(p[0][1])) for p in approx]
+                raw_points=contour[:,0,:].astype(np.float32)
+                smoothed=self._corner_preserving_smooth(raw_points,smoothness)
+                smoothed_contour=smoothed.reshape((-1,1,2)).astype(np.float32)
+                perimeter=cv2.arcLength(smoothed_contour,True)
+                epsilon=perimeter*(detail/100.0)*0.006
+                approx=cv2.approxPolyDP(smoothed_contour,epsilon,True) if epsilon>0 else smoothed_contour
+                points=[(float(p[0][0]),float(p[0][1])) for p in approx]
                 if len(points) >= 3:
                     result.append(points)
 
             self.analysis_contours = result
             self.status_lbl.config(
-                text=f"Detected {len(result)} vector path{'s' if len(result) != 1 else ''}.",
+                text=f"Detected {len(result)} path{'s' if len(result)!=1 else ''} • {sum(len(p) for p in result)} points.",
                 fg=SUCCESS if result else WARNING,
             )
             self._draw_preview()
@@ -2332,6 +2357,8 @@ class StickerCutlineTab(tk.Frame, DropMixin):
         self.offset_var.set(0.0)
         self.include_holes_var.set(False)
         self.line_width_var.set(0.25)
+        self.smoothness_var.set(30)
+        self.detail_var.set(35)
         self._schedule_analysis()
 
     def _source_size_mm(self):
@@ -3993,6 +4020,8 @@ class ScanCroppingTab(tk.Frame,DropMixin):
         super().__init__(parent,bg=BG)
         self.pages=[]; self.current_page=-1; self.selected_crop=-1
         self.canvas_photo=None; self._drag_corner=None; self._busy=False
+        self._drag_mode=None; self._drag_side=None; self._drag_start=None; self._drag_original=None
+        self._magnifier_photo=None
         self._worker_results=queue.Queue(); self._scan_generation=0
         self._poll_job=None
         self._build(); self._poll_job=self.after(80,self._poll_worker_results)
@@ -4033,7 +4062,7 @@ class ScanCroppingTab(tk.Frame,DropMixin):
         self.canvas.bind("<Configure>",lambda e:self._draw_page())
         self.canvas.bind("<ButtonPress-1>",self._canvas_press)
         self.canvas.bind("<B1-Motion>",self._canvas_drag)
-        self.canvas.bind("<ButtonRelease-1>",lambda e:setattr(self,"_drag_corner",None))
+        self.canvas.bind("<ButtonRelease-1>",self._canvas_release)
         self.setup_drop_everywhere(self,self._drop_files,{".pdf"})
 
     def _poll_worker_results(self):
@@ -4098,23 +4127,38 @@ class ScanCroppingTab(tk.Frame,DropMixin):
         return np.array([pts[np.argmin(sums)],pts[np.argmin(diffs)],pts[np.argmax(sums)],pts[np.argmax(diffs)]],dtype=np.float32)
 
     def _detect_image(self,image,sensitivity=None,min_area_percent=None):
-        rgb=np.array(image.convert("RGB")); gray=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
-        threshold=max(5,min(70,int(self.sensitivity_var.get() if sensitivity is None else sensitivity)))
-        mask=np.where(gray<255-threshold,255,0).astype(np.uint8)
+        rgb=np.array(image.convert("RGB")); h,w=rgb.shape[:2]
+        threshold=max(4,min(80,int(self.sensitivity_var.get() if sensitivity is None else sensitivity)))
+        # Sample the scanner background from a border band. LAB colour distance
+        # separates pure-white paper from cream/yellow vintage photo borders.
+        band=max(4,int(min(h,w)*.025))
+        border=np.concatenate((rgb[:band].reshape(-1,3),rgb[-band:].reshape(-1,3),rgb[:, :band].reshape(-1,3),rgb[:, -band:].reshape(-1,3)),axis=0)
+        bg=np.median(border,axis=0).astype(np.uint8)
+        lab=cv2.cvtColor(rgb,cv2.COLOR_RGB2LAB).astype(np.float32)
+        bg_lab=cv2.cvtColor(bg.reshape(1,1,3),cv2.COLOR_RGB2LAB).astype(np.float32)[0,0]
+        distance=np.linalg.norm(lab-bg_lab,axis=2)
+        gray=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
+        # Colour distance catches yellowed edges; grayscale difference catches
+        # neutral photographs and shadows.
+        bg_gray=float(cv2.cvtColor(bg.reshape(1,1,3),cv2.COLOR_RGB2GRAY)[0,0])
+        mask=((distance>threshold*.55)|(np.abs(gray.astype(np.float32)-bg_gray)>threshold*.45)).astype(np.uint8)*255
         size=max(3,int(min(mask.shape[:2])*.006)); size+=1-size%2
         kernel=cv2.getStructuringElement(cv2.MORPH_RECT,(size,size))
         mask=cv2.morphologyEx(mask,cv2.MORPH_CLOSE,kernel,iterations=2)
+        mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,np.ones((3,3),np.uint8),iterations=1)
         contours,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
         area_percent=float(self.min_area_var.get() if min_area_percent is None else min_area_percent)
-        min_area=max(.001,area_percent/100)*image.width*image.height
-        crops=[]
+        min_area=max(.001,area_percent/100)*w*h; crops=[]
+        inset_px=max(1,round(1.5/25.4*100))
         for contour in contours:
             if cv2.contourArea(contour)<min_area:continue
-            rect=cv2.minAreaRect(contour); (_cx,_cy),(w,h),_angle=rect
-            if min(w,h)<35:continue
-            box=self._order_points(cv2.boxPoints(rect)); centre=box.mean(axis=0); box=centre+(box-centre)*0.992
-            box[:,0]=np.clip(box[:,0],0,image.width-1); box[:,1]=np.clip(box[:,1],0,image.height-1)
-            crops.append([(float(x/image.width),float(y/image.height)) for x,y in box])
+            rect=cv2.minAreaRect(contour); (_cx,_cy),(rw,rh),_angle=rect
+            if min(rw,rh)<35:continue
+            box=self._order_points(cv2.boxPoints(rect)); centre=box.mean(axis=0)
+            factor=max(.90,1-(2*inset_px/max(1,min(rw,rh))))
+            box=centre+(box-centre)*factor
+            box[:,0]=np.clip(box[:,0],0,w-1); box[:,1]=np.clip(box[:,1],0,h-1)
+            crops.append([(float(x/w),float(y/h)) for x,y in box])
         crops.sort(key=lambda points:(sum(y for _x,y in points)/4,sum(x for x,_y in points)/4))
         return crops
 
@@ -4180,29 +4224,74 @@ class ScanCroppingTab(tk.Frame,DropMixin):
             if index==self.selected_crop:
                 for corner in range(4):
                     x,y=flat[corner*2],flat[corner*2+1]; self.canvas.create_oval(x-7,y-7,x+7,y+7,fill=ACCENT,outline="white")
+                for side in range(4):
+                    x1,y1=flat[side*2],flat[side*2+1]; x2,y2=flat[((side+1)%4)*2],flat[((side+1)%4)*2+1]
+                    mx,my=(x1+x2)/2,(y1+y2)/2
+                    self.canvas.create_rectangle(mx-6,my-6,mx+6,my+6,fill=SUCCESS,outline="white")
         self.crop_count_lbl.config(text=f"{len(crops)} detected")
 
     def _canvas_press(self,event):
         geometry=self._geometry()
         if not geometry:return
-        _image,ox,oy,dw,dh=geometry; page=self.pages[self.current_page]; nearest=None
+        _image,ox,oy,dw,dh=geometry; page=self.pages[self.current_page]
+        nearest=None
         for index,points in enumerate(page["crops"]):
-            for corner,(nx,ny) in enumerate(points):
-                dist=(event.x-(ox+nx*dw))**2+(event.y-(oy+ny*dh))**2
-                if dist<=18**2 and (nearest is None or dist<nearest[0]):nearest=(dist,index,corner)
+            pixels=[(ox+x*dw,oy+y*dh) for x,y in points]
+            for corner,(px,py) in enumerate(pixels):
+                dist=(event.x-px)**2+(event.y-py)**2
+                if dist<=18**2 and (nearest is None or dist<nearest[0]):nearest=(dist,"corner",index,corner)
+            for side in range(4):
+                p1=np.array(pixels[side]); p2=np.array(pixels[(side+1)%4]); segment=p2-p1
+                length2=float(segment@segment)
+                if length2:
+                    u=max(0,min(1,float((np.array([event.x,event.y])-p1)@segment/length2))); closest=p1+u*segment
+                    dist=float(np.sum((np.array([event.x,event.y])-closest)**2))
+                    if dist<=12**2 and (nearest is None or dist<nearest[0]):nearest=(dist,"side",index,side)
         if nearest:
-            self.selected_crop=nearest[1]; self._drag_corner=nearest[2]; self._draw_page(); return
+            _,mode,index,part=nearest; self.selected_crop=index; self._drag_mode=mode
+            self._drag_corner=part if mode=="corner" else None; self._drag_side=part if mode=="side" else None
+            self._drag_start=(event.x,event.y); self._drag_original=[tuple(p) for p in page["crops"][index]]; self._draw_page(); self._draw_magnifier(event); return
         for index,points in enumerate(page["crops"]):
             polygon=np.array([(ox+x*dw,oy+y*dh) for x,y in points],np.float32)
-            if cv2.pointPolygonTest(polygon,(event.x,event.y),False)>=0:self.selected_crop=index; self._draw_page(); return
+            if cv2.pointPolygonTest(polygon,(event.x,event.y),False)>=0:
+                self.selected_crop=index; self._drag_mode="move"; self._drag_start=(event.x,event.y); self._drag_original=[tuple(p) for p in points]; self._draw_page(); return
 
     def _canvas_drag(self,event):
-        if self._drag_corner is None or self.selected_crop<0:return
+        if not self._drag_mode or self.selected_crop<0:return
         geometry=self._geometry()
         if not geometry:return
-        _image,ox,oy,dw,dh=geometry
+        _image,ox,oy,dw,dh=geometry; crop=self.pages[self.current_page]["crops"][self.selected_crop]
         nx=max(0,min(1,(event.x-ox)/max(1,dw))); ny=max(0,min(1,(event.y-oy)/max(1,dh)))
-        self.pages[self.current_page]["crops"][self.selected_crop][self._drag_corner]=(nx,ny); self._draw_page()
+        if self._drag_mode=="corner":crop[self._drag_corner]=(nx,ny)
+        else:
+            dx=(event.x-self._drag_start[0])/max(1,dw); dy=(event.y-self._drag_start[1])/max(1,dh)
+            indices=range(4) if self._drag_mode=="move" else (self._drag_side,(self._drag_side+1)%4)
+            updated=list(self._drag_original)
+            # Clamp the shared movement so the selected points remain on-page.
+            xs=[self._drag_original[i][0] for i in indices]; ys=[self._drag_original[i][1] for i in indices]
+            dx=max(-min(xs),min(1-max(xs),dx)); dy=max(-min(ys),min(1-max(ys),dy))
+            for i in indices:updated[i]=(self._drag_original[i][0]+dx,self._drag_original[i][1]+dy)
+            crop[:]=updated
+        self._draw_page(); self._draw_magnifier(event)
+
+    def _draw_magnifier(self,event):
+        geometry=self._geometry()
+        if not geometry:return
+        image,ox,oy,dw,dh=geometry
+        ix=int(max(0,min(image.width-1,(event.x-ox)/max(1,dw)*image.width))); iy=int(max(0,min(image.height-1,(event.y-oy)/max(1,dh)*image.height)))
+        radius=max(12,int(min(image.size)*.025)); box=(max(0,ix-radius),max(0,iy-radius),min(image.width,ix+radius),min(image.height,iy+radius))
+        patch=image.crop(box).resize((150,150),Image.Resampling.NEAREST)
+        draw=ImageDraw.Draw(patch); draw.line((75,0,75,150),fill="red",width=1); draw.line((0,75,150,75),fill="red",width=1)
+        self._magnifier_photo=ImageTk.PhotoImage(patch); patch.close()
+        x=max(8,self.canvas.winfo_width()-166); y=8
+        self.canvas.create_rectangle(x-2,y-2,x+152,y+152,fill="white",outline=ACCENT,width=2,tags="magnifier")
+        self.canvas.create_image(x,y,anchor="nw",image=self._magnifier_photo,tags="magnifier")
+
+    def _canvas_release(self,event=None):
+        self._drag_corner=None; self._drag_mode=None; self._drag_side=None; self._drag_start=None; self._drag_original=None
+        try:self.canvas.delete("magnifier")
+        except Exception:pass
+        self._magnifier_photo=None
 
     def _add_manual_crop(self):
         if self.current_page<0:return
@@ -4702,8 +4791,13 @@ class PrintCounterTab(tk.Frame):
         super().__init__(parent, bg=BG)
         self.rows = []
         self.active_row = None
+        self.active_summary_code = None
         self.search_codes = []
+        self.line_discounts = {}
+        self.global_discounts = []
         self._build()
+        self.bind_all("<F6>", self._discount_selected_line)
+        self.bind_all("<F7>", self._discount_whole_list)
 
     def on_show(self):
         try:
@@ -4722,6 +4816,8 @@ class PrintCounterTab(tk.Frame):
         styled_btn(toolbar, "➕  Add Row", self._add_row).pack(side="left", padx=12)
         styled_btn(toolbar, "🗑  Clear All", self._clear_all, style="secondary").pack(side="left", padx=4)
         styled_btn(toolbar, "📋  Copy Summary", self._copy_summary, style="secondary").pack(side="left", padx=4)
+        styled_btn(toolbar, "F6  Line discount", self._discount_selected_line, style="secondary").pack(side="left", padx=4)
+        styled_btn(toolbar, "F7  List discount", self._discount_whole_list, style="secondary").pack(side="left", padx=4)
         styled_btn(toolbar, "↔  WIDE FORMAT PRICING", self._open_wide_format_quote, style="success").pack(side="right", padx=12)
         tk.Label(toolbar,
                  text="Enter amount*code, for example 8*710 — Enter adds the next row",
@@ -4970,6 +5066,9 @@ class PrintCounterTab(tk.Frame):
         for row in self.rows:
             row["frame"].destroy()
         self.rows.clear()
+        self.line_discounts.clear()
+        self.global_discounts.clear()
+        self.active_summary_code=None
         self._add_row()
 
     def _parse_entry(self, text):
@@ -5006,91 +5105,117 @@ class PrintCounterTab(tk.Frame):
             return str(int(value))
         return f"{value:.2f}".rstrip("0").rstrip(".")
 
-    def _refresh_summary(self):
-        for widget in self._sum_inner.winfo_children():
-            widget.destroy()
-        totals = self._collect_totals()
+    @staticmethod
+    def _apply_discount(amount, discount):
+        kind,value=discount
+        if kind=="percent": return max(0.0,amount*(1.0-value/100.0))
+        return max(0.0,amount-value)
 
-        if not totals:
-            tk.Label(self._sum_inner,
-                     text="No valid entries yet\n\nExample: 8*710",
-                     bg=SURFACE, fg=MUTED, justify="left",
-                     font=("Segoe UI", 10)).pack(padx=14, pady=6, anchor="nw")
-            return
+    def _discount_dialog(self,title,allow_stack=False):
+        popup=tk.Toplevel(self); popup.title(title); popup.configure(bg=BG); popup.transient(self); popup.grab_set(); popup.resizable(False,False)
+        tk.Label(popup,text=title,bg=BG,fg=TEXT,font=("Segoe UI",12,"bold")).pack(anchor="w",padx=16,pady=(14,8))
+        kind=tk.StringVar(value="percent")
+        row=tk.Frame(popup,bg=BG); row.pack(fill="x",padx=16)
+        for caption,value in (("Percent %","percent"),("Fixed EUR","eur")):
+            tk.Radiobutton(row,text=caption,variable=kind,value=value,bg=BG,fg=TEXT,selectcolor=SURFACE2,activebackground=BG).pack(side="left",padx=(0,10))
+        value_var=tk.StringVar()
+        e=tk.Entry(popup,textvariable=value_var,bg=SURFACE2,fg=TEXT,insertbackground=TEXT,relief="flat",font=("Segoe UI",12,"bold")); e.pack(fill="x",padx=16,pady=10,ipady=5); e.focus_set()
+        mode=tk.StringVar(value="replace")
+        if allow_stack:
+            mode_row=tk.Frame(popup,bg=BG); mode_row.pack(fill="x",padx=16,pady=(0,8))
+            for caption,value in (("Replace existing discounts","replace"),("Stack with existing discounts","stack")):
+                tk.Radiobutton(mode_row,text=caption,variable=mode,value=value,bg=BG,fg=TEXT,selectcolor=SURFACE2,activebackground=BG).pack(anchor="w")
+        result={}
+        def accept():
+            try:
+                value=float(value_var.get().replace(",","."))
+                if value<0 or (kind.get()=="percent" and value>100): raise ValueError
+            except Exception:
+                messagebox.showwarning("Invalid discount","Enter a valid discount value.",parent=popup); return
+            result.update(kind=kind.get(),value=value,mode=mode.get()); popup.destroy()
+        buttons=tk.Frame(popup,bg=BG); buttons.pack(fill="x",padx=16,pady=(0,14))
+        styled_btn(buttons,"Apply",accept,style="success").pack(side="right")
+        styled_btn(buttons,"Cancel",popup.destroy,style="secondary").pack(side="right",padx=6)
+        e.bind("<Return>",lambda _e:accept()); popup.wait_window(); return result or None
 
-        header = tk.Frame(self._sum_inner, bg=SURFACE)
-        header.pack(fill="x", padx=14, pady=(2, 3))
-        columns = (("Input", 8), ("Qty", 6), ("PLU", 7),
-                   ("Description", 31), ("Unit €", 8), ("Total €", 10))
-        for text, width in columns:
-            tk.Label(header, text=text, bg=SURFACE, fg=MUTED,
-                     font=("Segoe UI", 8, "bold"), width=width,
-                     anchor="w").pack(side="left")
-        tk.Frame(self._sum_inner, bg=BORDER, height=1).pack(fill="x", padx=14, pady=(0, 4))
+    def _discount_selected_line(self,event=None):
+        code=self.active_summary_code
+        if not code:
+            messagebox.showinfo("Select a line","Click a line in the summary first, then press F6.",parent=self); return "break"
+        result=self._discount_dialog(f"Discount line {code}")
+        if result:
+            self.line_discounts[code]=(result["kind"],result["value"])
+            self._refresh_summary()
+        return "break"
 
-        grand_total = 0.0
-        missing_prices = 0
-        for code, total in sorted(totals.items()):
-            output = resolve_output_code(code, total)
-            price = get_plu_price(output)
-            line_total = total * price if price is not None else None
-            if line_total is not None:
-                grand_total += line_total
+    def _discount_whole_list(self,event=None):
+        if not self._collect_totals(): return "break"
+        result=self._discount_dialog("Discount whole list",allow_stack=True)
+        if result:
+            discount=(result["kind"],result["value"])
+            if result["mode"]=="replace":
+                self.line_discounts.clear(); self.global_discounts=[discount]
             else:
-                missing_prices += 1
+                self.global_discounts.append(discount)
+            self._refresh_summary()
+        return "break"
 
-            line = tk.Frame(self._sum_inner, bg=SURFACE)
-            line.pack(fill="x", padx=14, pady=3)
-            description = get_plu_description(output) or "Unknown code"
-            values = (
-                (code, 8, MUTED if output != code else TEXT, 9),
-                (self._fmt_qty(total), 6, TEXT, 9),
-                (output, 7, ACCENT if output != code else TEXT, 10),
-                (description, 31, TEXT, 9),
-                (f"{price:.2f}" if price is not None else "—", 8, TEXT if price is not None else WARNING, 9),
-                (f"{line_total:.2f}" if line_total is not None else "—", 10, SUCCESS if line_total is not None else WARNING, 10),
-            )
-            for text, width, color, size in values:
-                tk.Label(line, text=text, bg=SURFACE, fg=color,
-                         font=("Segoe UI", size, "bold" if size >= 11 else "normal"),
-                         width=width, anchor="w").pack(side="left")
+    def _refresh_summary(self):
+        for widget in self._sum_inner.winfo_children():widget.destroy()
+        totals=self._collect_totals()
+        if not totals:
+            tk.Label(self._sum_inner,text="No valid entries yet\n\nExample: 8*710",bg=SURFACE,fg=MUTED,justify="left",font=("Segoe UI",10)).pack(padx=14,pady=6,anchor="nw"); return
+        header=tk.Frame(self._sum_inner,bg=SURFACE); header.pack(fill="x",padx=14,pady=(2,3))
+        for name,width in (("Input",8),("Qty",6),("PLU",7),("Description",27),("Discount",12),("Total €",10)):
+            tk.Label(header,text=name,bg=SURFACE,fg=MUTED,font=("Segoe UI",8,"bold"),width=width,anchor="w").pack(side="left")
+        tk.Frame(self._sum_inner,bg=BORDER,height=1).pack(fill="x",padx=14,pady=(0,4))
+        subtotal=0.0; missing=0
+        for code,total in sorted(totals.items()):
+            output=resolve_output_code(code,total); price=get_plu_price(output); original=total*price if price is not None else None
+            final=original
+            discount_text="—"
+            if original is not None and code in self.line_discounts:
+                disc=self.line_discounts[code]; final=self._apply_discount(original,disc)
+                discount_text=(f"{disc[1]:g}%" if disc[0]=="percent" else f"€{disc[1]:.2f}")
+            if final is None:missing+=1
+            else:subtotal+=final
+            line=tk.Frame(self._sum_inner,bg=SURFACE2 if code==self.active_summary_code else SURFACE,cursor="hand2")
+            line.pack(fill="x",padx=14,pady=2)
+            line.bind("<Button-1>",lambda _e,c=code:self._select_summary_line(c))
+            values=((code,8,MUTED),(self._fmt_qty(total),6,TEXT),(output,7,ACCENT),(get_plu_description(output) or "Unknown code",27,TEXT),(discount_text,12,WARNING if discount_text!="—" else MUTED),(f"{final:.2f}" if final is not None else "—",10,SUCCESS if final is not None else WARNING))
+            for value,width,color in values:
+                label=tk.Label(line,text=value,bg=line.cget("bg"),fg=color,font=("Segoe UI",9),width=width,anchor="w")
+                label.pack(side="left"); label.bind("<Button-1>",lambda _e,c=code:self._select_summary_line(c))
+        final_total=subtotal
+        for discount in self.global_discounts:final_total=self._apply_discount(final_total,discount)
+        tk.Frame(self._sum_inner,bg=BORDER,height=1).pack(fill="x",padx=14,pady=(8,6))
+        if self.global_discounts:
+            text=[]
+            for kind,value in self.global_discounts:text.append(f"{value:g}%" if kind=="percent" else f"€{value:.2f}")
+            tk.Label(self._sum_inner,text="List discount: "+" + ".join(text)+f"   (€{subtotal:.2f} → €{final_total:.2f})",bg=SURFACE,fg=WARNING,font=("Segoe UI",9,"bold")).pack(anchor="e",padx=14,pady=(0,4))
+        total_row=tk.Frame(self._sum_inner,bg=SURFACE); total_row.pack(fill="x",padx=14)
+        tk.Label(total_row,text="GRAND TOTAL",bg=SURFACE,fg=TEXT,font=("Segoe UI",11,"bold")).pack(side="left")
+        tk.Label(total_row,text=f"€{final_total:.2f}",bg=SURFACE,fg=SUCCESS,font=("Segoe UI",18,"bold")).pack(side="right")
+        if missing:tk.Label(self._sum_inner,text=f"{missing} line(s) have no stored price",bg=SURFACE,fg=WARNING,font=("Segoe UI",8)).pack(anchor="e",padx=14,pady=(4,0))
 
-        tk.Frame(self._sum_inner, bg=BORDER, height=1).pack(fill="x", padx=14, pady=(8, 6))
-        total_row = tk.Frame(self._sum_inner, bg=SURFACE)
-        total_row.pack(fill="x", padx=14)
-        tk.Label(total_row, text="GRAND TOTAL", bg=SURFACE, fg=TEXT,
-                 font=("Segoe UI", 11, "bold")).pack(side="left")
-        tk.Label(total_row, text=f"€{grand_total:.2f}", bg=SURFACE, fg=SUCCESS,
-                 font=("Segoe UI", 18, "bold")).pack(side="right")
-        if missing_prices:
-            tk.Label(self._sum_inner,
-                     text=f"{missing_prices} line(s) have no stored price",
-                     bg=SURFACE, fg=WARNING, font=("Segoe UI", 8)
-                     ).pack(anchor="e", padx=14, pady=(4, 0))
+    def _select_summary_line(self,code):
+        self.active_summary_code=code; self._refresh_summary()
 
     def _copy_summary(self):
-        totals = self._collect_totals()
-        if not totals:
-            messagebox.showinfo("Nothing to copy", "No valid amount*code entries yet.")
-            return
-        lines = ["Input code\tQty\tOutput PLU\tDescription\tUnit EUR\tLine total EUR", "-" * 96]
-        grand_total = 0.0
-        for code, total in sorted(totals.items()):
-            output = resolve_output_code(code, total)
-            price = get_plu_price(output)
-            if price is None:
-                unit_text = line_text = "—"
-            else:
-                unit_text = f"{price:.2f}"
-                line_total = total * price
-                line_text = f"{line_total:.2f}"
-                grand_total += line_total
-            description = get_plu_description(output) or "Unknown code"
-            lines.append(f"{code}\t{self._fmt_qty(total)}\t{output}\t{description}\t{unit_text}\t{line_text}")
-        lines.extend(["-" * 96, f"GRAND TOTAL\t\t\t\t\t{grand_total:.2f} EUR"])
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(lines))
-        messagebox.showinfo("Copied", "Priced summary copied to clipboard.")
+        totals=self._collect_totals()
+        if not totals:messagebox.showinfo("Nothing to copy","No valid amount*code entries yet."); return
+        lines=["Input code\tQty\tOutput PLU\tDescription\tDiscount\tFinal EUR","-"*96]; subtotal=0.0
+        for code,total in sorted(totals.items()):
+            output=resolve_output_code(code,total); price=get_plu_price(output); original=total*price if price is not None else None
+            final=original; discount_text="—"
+            if original is not None and code in self.line_discounts:
+                disc=self.line_discounts[code]; final=self._apply_discount(original,disc); discount_text=f"{disc[1]:g}%" if disc[0]=="percent" else f"{disc[1]:.2f} EUR"
+            if final is not None:subtotal+=final
+            lines.append(f"{code}\t{self._fmt_qty(total)}\t{output}\t{get_plu_description(output) or 'Unknown code'}\t{discount_text}\t{final:.2f}" if final is not None else f"{code}\t{self._fmt_qty(total)}\t{output}\tUnknown code\t—\t—")
+        final_total=subtotal
+        for disc in self.global_discounts:final_total=self._apply_discount(final_total,disc)
+        lines.extend(["-"*96,f"GRAND TOTAL\t\t\t\t\t{final_total:.2f} EUR"])
+        self.clipboard_clear(); self.clipboard_append("\n".join(lines)); messagebox.showinfo("Copied","Priced summary copied to clipboard.")
 
 
     def _open_wide_format_quote(self):
